@@ -1,0 +1,899 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VideoTranscriber</title>
+<style>
+  :root {
+    --bg: #0a0a0b;
+    --surface: #141416;
+    --surface2: #1c1c20;
+    --border: #2a2a30;
+    --text: #e4e4e7;
+    --text2: #a1a1aa;
+    --accent: #6d5acd;
+    --accent2: #8b7ae0;
+    --success: #34d399;
+    --error: #f87171;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'SF Pro', system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  .app {
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 40px 24px;
+  }
+
+  header {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    margin-bottom: 32px;
+  }
+
+  header h1 {
+    font-size: 24px;
+    font-weight: 700;
+    letter-spacing: -0.5px;
+  }
+
+  header span {
+    font-size: 13px;
+    color: var(--text2);
+  }
+
+  .model-select {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    color: var(--text2);
+  }
+
+  .model-select select {
+    background: var(--surface2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 5px 10px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+
+  /* Drop Zone */
+  .dropzone {
+    border: 2px dashed var(--border);
+    border-radius: 16px;
+    padding: 64px 32px;
+    text-align: center;
+    cursor: pointer;
+    transition: all 0.2s;
+    background: var(--surface);
+    position: relative;
+  }
+
+  .dropzone:hover, .dropzone.dragover {
+    border-color: var(--accent);
+    background: rgba(109, 90, 205, 0.06);
+  }
+
+  .dropzone.dragover {
+    transform: scale(1.01);
+  }
+
+  .dropzone-icon {
+    font-size: 48px;
+    margin-bottom: 16px;
+    opacity: 0.5;
+  }
+
+  .dropzone h2 {
+    font-size: 18px;
+    font-weight: 600;
+    margin-bottom: 6px;
+  }
+
+  .dropzone p {
+    font-size: 14px;
+    color: var(--text2);
+  }
+
+  .dropzone input {
+    position: absolute;
+    inset: 0;
+    opacity: 0;
+    cursor: pointer;
+  }
+
+  /* Processing State */
+  .processing {
+    display: none;
+    background: var(--surface);
+    border-radius: 16px;
+    padding: 40px 32px;
+    text-align: center;
+    border: 1px solid var(--border);
+  }
+
+  .processing.active { display: block; }
+
+  .processing h3 {
+    font-size: 16px;
+    font-weight: 600;
+    margin-bottom: 8px;
+  }
+
+  .processing .status-msg {
+    color: var(--text2);
+    font-size: 14px;
+    margin-bottom: 24px;
+  }
+
+  .steps {
+    display: flex;
+    justify-content: center;
+    gap: 32px;
+  }
+
+  .step {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    opacity: 0.3;
+    transition: opacity 0.3s;
+  }
+
+  .step.active { opacity: 1; }
+  .step.done { opacity: 0.7; }
+
+  .step-dot {
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    background: var(--surface2);
+    border: 2px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 16px;
+    transition: all 0.3s;
+  }
+
+  .step.active .step-dot {
+    border-color: var(--accent);
+    background: rgba(109, 90, 205, 0.15);
+    animation: pulse 1.5s ease-in-out infinite;
+  }
+
+  .step.done .step-dot {
+    border-color: var(--success);
+    background: rgba(52, 211, 153, 0.15);
+  }
+
+  @keyframes pulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(109, 90, 205, 0.3); }
+    50% { box-shadow: 0 0 0 8px rgba(109, 90, 205, 0); }
+  }
+
+  .step-label {
+    font-size: 12px;
+    color: var(--text2);
+  }
+
+  /* Results */
+  .result {
+    display: none;
+    margin-top: 24px;
+  }
+
+  .result.active { display: block; }
+
+  .result-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 16px;
+    padding: 16px 20px;
+    background: var(--surface);
+    border-radius: 12px;
+    border: 1px solid var(--border);
+  }
+
+  .result-meta {
+    display: flex;
+    gap: 20px;
+    font-size: 13px;
+    color: var(--text2);
+  }
+
+  .result-actions {
+    display: flex;
+    gap: 8px;
+  }
+
+  .btn {
+    padding: 7px 14px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--surface2);
+    color: var(--text);
+    font-size: 13px;
+    cursor: pointer;
+    transition: all 0.15s;
+    white-space: nowrap;
+  }
+
+  .btn:hover {
+    border-color: var(--accent);
+    background: rgba(109, 90, 205, 0.1);
+  }
+
+  .btn-primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: white;
+  }
+
+  .btn-primary:hover {
+    background: var(--accent2);
+  }
+
+  .btn.copied {
+    border-color: var(--success);
+    color: var(--success);
+  }
+
+  .transcript-section {
+    margin-bottom: 20px;
+  }
+
+  .section-title {
+    font-size: 14px;
+    font-weight: 600;
+    margin-bottom: 10px;
+    color: var(--text2);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  .transcript-box {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+    font-size: 14px;
+    line-height: 1.7;
+    max-height: 300px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    color: var(--text);
+  }
+
+  .frames-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+    gap: 10px;
+  }
+
+  .frames-grid img {
+    width: 100%;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    cursor: pointer;
+    transition: transform 0.15s, border-color 0.15s;
+  }
+
+  .frames-grid img:hover {
+    transform: scale(1.03);
+    border-color: var(--accent);
+  }
+
+  /* Lightbox */
+  .lightbox {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.9);
+    z-index: 100;
+    cursor: pointer;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .lightbox.active { display: flex; }
+
+  .lightbox img {
+    max-width: 90vw;
+    max-height: 90vh;
+    border-radius: 8px;
+  }
+
+  /* History */
+  .history {
+    margin-top: 48px;
+  }
+
+  .history-title {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text2);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 12px;
+  }
+
+  .history-item {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 10px 16px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    margin-bottom: 6px;
+    cursor: pointer;
+    transition: border-color 0.15s;
+  }
+
+  .history-item:hover {
+    border-color: var(--accent);
+  }
+
+  .history-thumb {
+    width: 56px;
+    height: 36px;
+    border-radius: 5px;
+    object-fit: cover;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+
+  .history-item .name {
+    font-size: 14px;
+    font-weight: 500;
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .history-item .meta {
+    font-size: 12px;
+    color: var(--text2);
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    flex-shrink: 0;
+    margin-left: auto;
+  }
+
+  .new-btn {
+    display: none;
+    margin-bottom: 20px;
+  }
+
+  .new-btn.active { display: inline-flex; }
+
+  .error-msg {
+    display: none;
+    background: rgba(248, 113, 113, 0.1);
+    border: 1px solid var(--error);
+    color: var(--error);
+    padding: 12px 16px;
+    border-radius: 10px;
+    margin-top: 16px;
+    font-size: 14px;
+  }
+
+  .error-msg.active { display: block; }
+
+  /* Status */
+  .status-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 16px;
+    padding: 12px 16px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+  }
+
+  .status-bar .label {
+    font-size: 12px;
+    color: var(--text2);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-right: 4px;
+  }
+
+  .status-btn {
+    padding: 5px 12px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--surface2);
+    color: var(--text2);
+    font-size: 12px;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .status-btn:hover { border-color: var(--text2); color: var(--text); }
+
+  .status-btn.active-doing  { border-color: #60a5fa; color: #60a5fa; background: rgba(96,165,250,0.1); }
+  .status-btn.active-skipped { border-color: #a1a1aa; color: #a1a1aa; background: rgba(161,161,170,0.08); }
+  .status-btn.active-revisit { border-color: #fbbf24; color: #fbbf24; background: rgba(251,191,36,0.1); }
+  .status-btn.active-delete  { border-color: var(--error); color: var(--error); background: rgba(248,113,113,0.1); }
+
+  .status-date {
+    margin-left: auto;
+    font-size: 11px;
+    color: var(--text2);
+  }
+
+  /* History status badges */
+  .history-item .status-badge {
+    font-size: 10px;
+    padding: 2px 7px;
+    border-radius: 4px;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+    font-weight: 600;
+    flex-shrink: 0;
+  }
+
+  .badge-new     { color: var(--accent); background: rgba(109,90,205,0.12); }
+  .badge-doing   { color: #60a5fa; background: rgba(96,165,250,0.12); }
+  .badge-skipped { color: #71717a; background: rgba(113,113,122,0.12); }
+  .badge-revisit { color: #fbbf24; background: rgba(251,191,36,0.12); }
+
+  .history-item .date {
+    font-size: 11px;
+    color: var(--text2);
+    opacity: 0.7;
+    min-width: 110px;
+    text-align: right;
+  }
+
+  .history-item .dur {
+    min-width: 36px;
+    text-align: right;
+  }
+
+  .history-item.is-skipped { opacity: 0.5; }
+  .history-item.is-skipped:hover { opacity: 0.8; }
+
+  .history-status-select {
+    background: var(--surface2);
+    color: var(--text2);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    padding: 3px 6px;
+    font-size: 11px;
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: border-color 0.15s;
+  }
+
+  .history-status-select:hover { border-color: var(--accent); }
+  .history-status-select.sel-doing  { color: #60a5fa; border-color: #60a5fa; }
+  .history-status-select.sel-skipped { color: #71717a; border-color: #71717a; }
+  .history-status-select.sel-revisit { color: #fbbf24; border-color: #fbbf24; }
+  .history-status-select.sel-new    { color: var(--accent); border-color: var(--accent); }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <h1>VideoTranscriber</h1>
+    <span>Drop a video. Get a transcript + frames for Claude.</span>
+    <div class="model-select">
+      <label for="model">Whisper model:</label>
+      <select id="model">
+        <option value="tiny">tiny (fastest)</option>
+        <option value="base" selected>base (balanced)</option>
+        <option value="small">small (better)</option>
+        <option value="medium">medium (great)</option>
+        <option value="large">large (best)</option>
+      </select>
+    </div>
+  </header>
+
+  <button class="btn new-btn" id="newBtn" onclick="resetUI()">+ New transcription</button>
+
+  <div class="dropzone" id="dropzone">
+    <input type="file" id="fileInput" accept="video/*,.mp4,.mov,.webm,.mkv,.avi">
+    <div class="dropzone-icon">&#9654;</div>
+    <h2>Drop a video here</h2>
+    <p>MP4, MOV, WebM, MKV — any video file</p>
+  </div>
+
+  <div class="processing" id="processing">
+    <h3 id="processingTitle">Processing...</h3>
+    <p class="status-msg" id="statusMsg">Starting...</p>
+    <div class="steps">
+      <div class="step" id="step-analyzing">
+        <div class="step-dot">1</div>
+        <span class="step-label">Analyze</span>
+      </div>
+      <div class="step" id="step-transcribing">
+        <div class="step-dot">2</div>
+        <span class="step-label">Transcribe</span>
+      </div>
+      <div class="step" id="step-frames">
+        <div class="step-dot">3</div>
+        <span class="step-label">Frames</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="error-msg" id="errorMsg"></div>
+
+  <div class="result" id="result">
+    <div class="result-header">
+      <div class="result-meta" id="resultMeta"></div>
+      <div class="result-actions">
+        <button class="btn" id="copyTranscriptBtn" onclick="copyTranscript()">Copy transcript</button>
+        <button class="btn btn-primary" id="copyClaudeBtn" onclick="copyForClaude()">Copy for Claude</button>
+      </div>
+    </div>
+
+    <div class="status-bar" id="statusBar">
+      <span class="label">Status</span>
+      <button class="status-btn" data-status="doing" onclick="setStatus('doing')">Doing It</button>
+      <button class="status-btn" data-status="skipped" onclick="setStatus('skipped')">Skipped</button>
+      <button class="status-btn" data-status="revisit" onclick="setStatus('revisit')">Revisit Later</button>
+      <button class="status-btn" data-status="delete" onclick="setStatus('delete')">Delete</button>
+      <span class="status-date" id="statusDate"></span>
+    </div>
+
+    <div class="transcript-section">
+      <div class="section-title">Transcript</div>
+      <div class="transcript-box" id="transcriptBox"></div>
+    </div>
+
+    <div>
+      <div class="section-title">Key Frames <span id="frameCount"></span></div>
+      <div class="frames-grid" id="framesGrid"></div>
+    </div>
+  </div>
+
+  <div class="history" id="historySection">
+    <div class="history-title">Previous Transcriptions</div>
+    <div id="historyList"></div>
+  </div>
+</div>
+
+<div class="lightbox" id="lightbox" onclick="this.classList.remove('active')">
+  <img id="lightboxImg" src="">
+</div>
+
+<script>
+const dropzone = document.getElementById('dropzone');
+const fileInput = document.getElementById('fileInput');
+const processing = document.getElementById('processing');
+const result = document.getElementById('result');
+const newBtn = document.getElementById('newBtn');
+
+let currentData = null;
+let currentJobId = null;
+
+// Drag & drop
+dropzone.addEventListener('dragover', e => {
+  e.preventDefault();
+  dropzone.classList.add('dragover');
+});
+
+dropzone.addEventListener('dragleave', () => {
+  dropzone.classList.remove('dragover');
+});
+
+dropzone.addEventListener('drop', e => {
+  e.preventDefault();
+  dropzone.classList.remove('dragover');
+  if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+});
+
+fileInput.addEventListener('change', e => {
+  if (e.target.files.length) handleFile(e.target.files[0]);
+});
+
+async function handleFile(file) {
+  dropzone.style.display = 'none';
+  processing.classList.add('active');
+  result.classList.remove('active');
+  document.getElementById('errorMsg').classList.remove('active');
+  newBtn.classList.add('active');
+
+  document.getElementById('processingTitle').textContent = file.name;
+
+  const formData = new FormData();
+  formData.append('file', file);
+  formData.append('model', document.getElementById('model').value);
+
+  try {
+    const res = await fetch('/api/upload', { method: 'POST', body: formData });
+    const { job_id } = await res.json();
+    currentJobId = job_id;
+    listenToStream(job_id);
+  } catch (err) {
+    showError('Upload failed: ' + err.message);
+  }
+}
+
+function listenToStream(jobId) {
+  const source = new EventSource(`/api/stream/${jobId}`);
+
+  source.onmessage = (e) => {
+    const data = JSON.parse(e.data);
+
+    document.getElementById('statusMsg').textContent = data.message;
+
+    // Update steps
+    const stepOrder = ['analyzing', 'transcribing', 'frames', 'complete'];
+    const currentIdx = stepOrder.indexOf(data.status);
+
+    stepOrder.forEach((step, i) => {
+      const el = document.getElementById(`step-${step}`);
+      if (!el) return;
+      el.classList.remove('active', 'done');
+      if (i < currentIdx) el.classList.add('done');
+      else if (i === currentIdx) el.classList.add('active');
+    });
+
+    if (data.status === 'complete') {
+      source.close();
+      currentData = data.data;
+      currentData.job_id = jobId;
+      showResult(data.data, jobId);
+      loadHistory();
+    }
+
+    if (data.status === 'error') {
+      source.close();
+      showError(data.message);
+    }
+  };
+
+  source.onerror = () => {
+    source.close();
+    showError('Connection lost during processing');
+  };
+}
+
+function showResult(data, jobId) {
+  processing.classList.remove('active');
+  result.classList.add('active');
+
+  const title = data.summary || data.original_name;
+  document.getElementById('resultMeta').innerHTML =
+    `<span>${title}</span>` +
+    `<span>${data.duration_fmt}</span>` +
+    `<span>whisper-${data.model}</span>` +
+    `<span>${data.frame_count} frames</span>`;
+
+  // Status bar
+  updateStatusUI(data.item_status || 'new', data.status_date || data.created_at || '');
+
+  document.getElementById('transcriptBox').textContent = data.transcript;
+  document.getElementById('frameCount').textContent = `(${data.frame_count})`;
+
+  const grid = document.getElementById('framesGrid');
+  grid.innerHTML = '';
+  data.frames.forEach(f => {
+    const img = document.createElement('img');
+    img.src = `/api/frames/${jobId}/${f}`;
+    img.loading = 'lazy';
+    img.onclick = () => openLightbox(img.src);
+    grid.appendChild(img);
+  });
+}
+
+function updateStatusUI(status, date) {
+  document.querySelectorAll('.status-btn').forEach(btn => {
+    const s = btn.dataset.status;
+    btn.classList.remove('active-doing', 'active-skipped', 'active-revisit', 'active-delete');
+    if (s === status) btn.classList.add('active-' + s);
+  });
+  const dateEl = document.getElementById('statusDate');
+  dateEl.textContent = date ? date : '';
+}
+
+async function setStatus(status) {
+  if (!currentJobId) return;
+
+  if (status === 'delete') {
+    if (!confirm('Delete this transcription?')) return;
+  }
+
+  const res = await fetch('/api/status/' + currentJobId, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ status }),
+  });
+  const data = await res.json();
+
+  if (data.deleted) {
+    resetUI();
+    loadHistory();
+    return;
+  }
+
+  if (data.ok) {
+    currentData.item_status = data.item_status;
+    currentData.status_date = data.status_date;
+    updateStatusUI(data.item_status, data.status_date);
+    loadHistory();
+  }
+}
+
+function showError(msg) {
+  processing.classList.remove('active');
+  const el = document.getElementById('errorMsg');
+  el.textContent = msg;
+  el.classList.add('active');
+}
+
+function resetUI() {
+  dropzone.style.display = '';
+  processing.classList.remove('active');
+  result.classList.remove('active');
+  document.getElementById('errorMsg').classList.remove('active');
+  newBtn.classList.remove('active');
+  fileInput.value = '';
+  currentData = null;
+  currentJobId = null;
+}
+
+function copyTranscript() {
+  if (!currentData) return;
+  navigator.clipboard.writeText(currentData.transcript);
+  flashBtn('copyTranscriptBtn', 'Copied!');
+}
+
+function copyForClaude() {
+  if (!currentData) return;
+  let text = currentData.claude_prompt;
+  if (!text) {
+    // Fallback for old jobs without pre-built prompt
+    const dir = currentData.output_dir || '';
+    const framePaths = (currentData.frames || []).map(f => 'read ' + dir + '/frames/' + f);
+    text = [
+      'I have a video I want you to understand. First read the transcript and all the frames below, then explain what the video is about — the key concepts, techniques, or ideas being shown. After your summary, ask me what I\'d like to do with this information.',
+      '',
+      'Video: ' + currentData.original_name + ' (' + currentData.duration_fmt + ')',
+      '',
+      '## Transcript',
+      currentData.transcript,
+      '',
+      '## Key Frames (' + currentData.frame_count + ' — read each one)',
+    ].concat(framePaths).join('\n');
+  }
+  navigator.clipboard.writeText(text);
+  flashBtn('copyClaudeBtn', 'Copied!');
+}
+
+function flashBtn(id, text) {
+  const btn = document.getElementById(id);
+  const orig = btn.textContent;
+  btn.textContent = text;
+  btn.classList.add('copied');
+  setTimeout(() => {
+    btn.textContent = orig;
+    btn.classList.remove('copied');
+  }, 1500);
+}
+
+function openLightbox(src) {
+  document.getElementById('lightboxImg').src = src;
+  document.getElementById('lightbox').classList.add('active');
+}
+
+// History
+async function loadHistory() {
+  try {
+    const res = await fetch('/api/history');
+    const items = await res.json();
+    const list = document.getElementById('historyList');
+    list.innerHTML = '';
+
+    if (items.length === 0) {
+      document.getElementById('historySection').style.display = 'none';
+      return;
+    }
+    document.getElementById('historySection').style.display = '';
+
+    const statusLabels = { new: 'New', doing: 'Doing It', skipped: 'Skipped', revisit: 'Revisit' };
+
+    items.forEach(item => {
+      const div = document.createElement('div');
+      const st = item.item_status || 'new';
+      div.className = 'history-item' + (st === 'skipped' ? ' is-skipped' : '');
+      const label = item.summary || item.original_name;
+      const date = item.status_date || item.created_at || '';
+
+      const nameSpan = document.createElement('span');
+      nameSpan.className = 'name';
+      nameSpan.textContent = label;
+
+      const metaSpan = document.createElement('span');
+      metaSpan.className = 'meta';
+
+      const sel = document.createElement('select');
+      sel.className = 'history-status-select sel-' + st;
+      [{v:'new',l:'New'},{v:'doing',l:'Doing It'},{v:'skipped',l:'Skipped'},{v:'revisit',l:'Revisit'},{v:'delete',l:'Delete'}].forEach(o => {
+        const opt = document.createElement('option');
+        opt.value = o.v; opt.textContent = o.l;
+        if (o.v === st) opt.selected = true;
+        sel.appendChild(opt);
+      });
+      sel.onclick = e => e.stopPropagation();
+      sel.onchange = async e => {
+        e.stopPropagation();
+        const newSt = sel.value;
+        if (newSt === 'delete' && !confirm('Delete this transcription?')) {
+          sel.value = st;
+          return;
+        }
+        const res = await fetch('/api/status/' + item.job_id, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ status: newSt }),
+        });
+        const data = await res.json();
+        if (data.ok) loadHistory();
+      };
+
+      const dateSpan = document.createElement('span');
+      dateSpan.className = 'date';
+      dateSpan.textContent = date;
+
+      const durSpan = document.createElement('span');
+      durSpan.className = 'dur';
+      durSpan.textContent = item.duration_fmt;
+
+      metaSpan.appendChild(dateSpan);
+      metaSpan.appendChild(durSpan);
+      metaSpan.appendChild(sel);
+
+      if (item.frames && item.frames.length) {
+        const thumb = document.createElement('img');
+        thumb.className = 'history-thumb';
+        thumb.src = `/api/frames/${item.job_id}/${item.frames[0]}`;
+        thumb.alt = '';
+        thumb.loading = 'lazy';
+        div.appendChild(thumb);
+      }
+      div.appendChild(nameSpan);
+      div.appendChild(metaSpan);
+      div.onclick = () => {
+        currentData = item;
+        currentJobId = item.job_id;
+        dropzone.style.display = 'none';
+        processing.classList.remove('active');
+        newBtn.classList.add('active');
+        showResult(item, item.job_id);
+      };
+      list.appendChild(div);
+    });
+  } catch {}
+}
+
+loadHistory();
+</script>
+</body>
+</html>
