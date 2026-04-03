@@ -1,4 +1,4 @@
-"""VideoTranscriber — Drop a video, get a transcript + key frames for Claude Code."""
+"""VideoAnalyzer — Drop a video, get a transcript + key frames for Claude Code."""
 
 import os
 import sys
@@ -347,7 +347,7 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, cleanup)
     signal.signal(signal.SIGINT, cleanup)
 
-    print(f"\n  VideoTranscriber running at http://localhost:{port}\n")
+    print(f"\n  VideoAnalyzer running at http://localhost:{port}\n")
 
     try:
         app.run(host="127.0.0.1", port=port, debug=False)

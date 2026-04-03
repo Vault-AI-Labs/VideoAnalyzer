@@ -1,4 +1,4 @@
-# VideoTranscriber
+# VideoAnalyzer
 
 Drop videos, extract transcripts and frames for AI.
 
@@ -12,8 +12,8 @@ Local web app that takes any video file (TikTok downloads, screen recordings, tu
 ## Architecture
 
 ```
-~/Desktop/VideoTranscriber.app    # macOS .app launcher (double-click)
-~/PROJECTS/VideoTranscriber/      # Source code
+~/Desktop/VideoAnalyzer.app    # macOS .app launcher (double-click)
+~/PROJECTS/VideoAnalyzer/      # Source code
 ~/.video-transcriber/             # Runtime data
   ├── port                        # Current port (written on startup)
   ├── videotranscriber.log        # Server log
@@ -89,11 +89,11 @@ Dropdown in the header: tiny (fastest) through large (best accuracy). Default is
 ## Running
 
 ### Desktop (primary)
-Double-click `VideoTranscriber.app` on Desktop.
+Double-click `VideoAnalyzer.app` on Desktop.
 
 ### CLI
 ```bash
-~/PROJECTS/VideoTranscriber/start.sh
+~/PROJECTS/VideoAnalyzer/start.sh
 ```
 
 ### CLI tool (standalone)
