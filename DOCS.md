@@ -1,13 +1,14 @@
 # VideoAnalyzer
 
-Drop videos, extract transcripts and frames for AI.
+Drop a video. Get a transcript and an action prompt for Claude.
 
 ## What It Does
 
 Local web app that takes any video file (TikTok downloads, screen recordings, tutorials) and produces:
 - Full transcript via OpenAI Whisper (runs locally)
 - Key frames extracted at smart intervals via ffmpeg
-- A "Copy for Claude" button that packages everything into a paste-ready prompt with `read` commands for every frame
+- Thumbnail previews in the history list for quick visual reference
+- A "Copy for Claude" button that packages everything into a paste-ready action prompt with `read` commands for every frame
 
 ## Architecture
 
