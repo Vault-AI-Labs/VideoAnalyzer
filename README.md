@@ -67,6 +67,8 @@ cd VideoAnalyzer
 
 Opens at `http://localhost:7745`. Drop a video and go.
 
+> **Note:** The app auto-discovers `ffprobe`, `ffmpeg`, and `whisper` binaries at startup, including from `/opt/homebrew/bin` and `/usr/local/bin`. This means it works correctly under `uv run` even when the shell PATH isn't fully inherited.
+
 ### macOS Desktop App
 
 Double-click `VideoAnalyzer.app` on your Desktop (if you've built the launcher).

@@ -15,6 +15,14 @@ from flask import Flask, request, jsonify, render_template, send_file, Response
 
 app = Flask(__name__)
 
+# Resolve binary paths — uv run may not inherit the full shell PATH
+import shutil
+
+_SEARCH_PATHS = os.environ.get("PATH", "") + ":/opt/homebrew/bin:/usr/local/bin"
+FFPROBE = shutil.which("ffprobe", path=_SEARCH_PATHS) or "ffprobe"
+FFMPEG = shutil.which("ffmpeg", path=_SEARCH_PATHS) or "ffmpeg"
+WHISPER = shutil.which("whisper", path=_SEARCH_PATHS) or "whisper"
+
 DATA_DIR = Path.home() / ".video-transcriber"
 UPLOADS = DATA_DIR / "uploads"
 OUTPUTS = DATA_DIR / "outputs"
@@ -133,7 +141,7 @@ def process_video(job_id, video_path, original_name, model):
         # Analyze
         q.put({"status": "analyzing", "message": "Analyzing video..."})
         result = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+            [FFPROBE, "-v", "error", "-show_entries", "format=duration",
              "-of", "csv=p=0", str(video_path)],
             capture_output=True, text=True,
         )
@@ -142,7 +150,7 @@ def process_video(job_id, video_path, original_name, model):
         # Transcribe (with heartbeat so SSE stream doesn't timeout on long videos)
         q.put({"status": "transcribing", "message": f"Transcribing with whisper-{model}..."})
         whisper_proc = subprocess.Popen(
-            ["whisper", str(video_path), "--model", model, "--output_dir", str(out_dir),
+            [WHISPER, str(video_path), "--model", model, "--output_dir", str(out_dir),
              "--output_format", "txt", "--language", "en"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
@@ -174,7 +182,7 @@ def process_video(job_id, video_path, original_name, model):
             interval = 20
 
         ffmpeg_proc = subprocess.Popen(
-            ["ffmpeg", "-i", str(video_path),
+            [FFMPEG, "-i", str(video_path),
              "-vf", f"fps=1/{interval},scale=640:-2",
              "-q:v", "3", str(frames_dir / "frame_%03d.jpg"), "-y"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
