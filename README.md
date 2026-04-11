@@ -77,17 +77,18 @@ Double-click `VideoAnalyzer.app` on your Desktop (if you've built the launcher).
 
 1. **Upload** — Drop any video file (MP4, MOV, WebM, MKV, AVI)
 2. **Analyze** — ffprobe extracts video duration
-3. **Transcribe** — Whisper processes audio locally (model selectable)
-4. **Extract Frames** — ffmpeg pulls key frames at smart intervals:
+3. **Extract Audio** — ffmpeg converts audio to 16kHz mono WAV (handles all codecs reliably)
+4. **Transcribe** — Whisper processes the extracted audio locally (model selectable)
+5. **Extract Frames** — ffmpeg pulls key frames at smart intervals:
    - Under 60s: every 3 seconds
    - 60-180s: every 10 seconds
    - Over 180s: every 20 seconds
    - Capped at 24 frames
-5. **Generate Title** — Local LLM creates a 5-7 word headline
-6. **Build Prompt** — Server-side construction with verified absolute frame paths
-7. **Ready** — Copy for Claude, review the transcript, or browse frames
+6. **Generate Title** — Local LLM creates a 5-7 word headline
+7. **Build Prompt** — Server-side construction with verified absolute frame paths
+8. **Ready** — Copy for Claude, review the transcript, or browse frames
 
-Long-running transcriptions use heartbeat events every 30s to keep the connection alive — no timeouts on big videos.
+Long-running transcriptions send heartbeat events every 30s to keep the SSE connection alive — no timeouts on big videos.
 
 ## Stack
 

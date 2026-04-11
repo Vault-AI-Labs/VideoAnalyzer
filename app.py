@@ -130,6 +130,27 @@ def _heuristic_title(transcript: str) -> str:
     return (s[0].upper() + s[1:]) if s else "Untitled"
 
 
+def _run_with_heartbeat(cmd, q, status_msg, timeout=600):
+    """Run a subprocess with periodic heartbeat messages, draining pipes properly."""
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    done = threading.Event()
+
+    def heartbeat():
+        while not done.wait(30):
+            q.put({"status": "processing", "message": f"{status_msg} (still working)"})
+
+    hb = threading.Thread(target=heartbeat, daemon=True)
+    hb.start()
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        stdout, stderr = proc.communicate()
+    finally:
+        done.set()
+    return proc.returncode, stdout, stderr
+
+
 def process_video(job_id, video_path, original_name, model):
     q = jobs[job_id]
     out_dir = OUTPUTS / job_id
@@ -147,27 +168,35 @@ def process_video(job_id, video_path, original_name, model):
         )
         duration = float(result.stdout.strip()) if result.stdout.strip() else 0
 
-        # Transcribe (with heartbeat so SSE stream doesn't timeout on long videos)
-        q.put({"status": "transcribing", "message": f"Transcribing with whisper-{model}..."})
-        whisper_proc = subprocess.Popen(
-            [WHISPER, str(video_path), "--model", model, "--output_dir", str(out_dir),
-             "--output_format", "txt", "--language", "en"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        # Extract audio to WAV first — handles all codecs reliably
+        q.put({"status": "transcribing", "message": "Extracting audio..."})
+        wav_path = out_dir / "audio.wav"
+        audio_result = subprocess.run(
+            [FFMPEG, "-i", str(video_path), "-vn", "-acodec", "pcm_s16le",
+             "-ar", "16000", "-ac", "1", str(wav_path), "-y"],
+            capture_output=True, timeout=120,
         )
-        while True:
-            try:
-                whisper_proc.wait(timeout=30)
-                break  # process finished
-            except subprocess.TimeoutExpired:
-                q.put({"status": "transcribing", "message": f"Transcribing with whisper-{model}... (still working)"})
-        if whisper_proc.returncode != 0:
-            stderr = whisper_proc.stderr.read()
-            raise RuntimeError(f"Whisper failed: {stderr[:500]}")
 
-        transcript_file = out_dir / f"{video_path.stem}.txt"
-        transcript = transcript_file.read_text().strip() if transcript_file.exists() else ""
+        transcript = ""
+        if audio_result.returncode == 0 and wav_path.exists() and wav_path.stat().st_size > 1000:
+            # Transcribe the extracted audio
+            q.put({"status": "transcribing", "message": f"Transcribing with whisper-{model}..."})
+            rc, stdout, stderr = _run_with_heartbeat(
+                [WHISPER, str(wav_path), "--model", model, "--output_dir", str(out_dir),
+                 "--output_format", "txt", "--language", "en"],
+                q, f"Transcribing with whisper-{model}",
+            )
+            if rc != 0:
+                raise RuntimeError(f"Whisper failed: {stderr[-500:].decode(errors='replace')}")
 
-        # Also save as clean transcript.txt
+            transcript_file = out_dir / "audio.txt"
+            transcript = transcript_file.read_text().strip() if transcript_file.exists() else ""
+            if transcript_file.exists():
+                transcript_file.unlink()
+
+        wav_path.unlink(missing_ok=True)
+
+        # Save clean transcript
         (out_dir / "transcript.txt").write_text(transcript or "No audio detected.")
 
         # Extract frames
@@ -181,31 +210,20 @@ def process_video(job_id, video_path, original_name, model):
         else:
             interval = 20
 
-        ffmpeg_proc = subprocess.Popen(
+        rc, stdout, stderr = _run_with_heartbeat(
             [FFMPEG, "-i", str(video_path),
              "-vf", f"fps=1/{interval},scale=640:-2",
              "-q:v", "3", str(frames_dir / "frame_%03d.jpg"), "-y"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            q, "Extracting key frames",
         )
-        while True:
-            try:
-                ffmpeg_proc.wait(timeout=30)
-                break
-            except subprocess.TimeoutExpired:
-                q.put({"status": "frames", "message": "Extracting key frames... (still working)"})
-        if ffmpeg_proc.returncode != 0:
-            stderr = ffmpeg_proc.stderr.read()
-            raise RuntimeError(f"FFmpeg failed: {stderr[:500]}")
+        if rc != 0:
+            raise RuntimeError(f"FFmpeg failed: {stderr[-500:].decode(errors='replace')}")
 
         # Cap at 24 frames
         frame_files = sorted(frames_dir.glob("*.jpg"))
         for f in frame_files[24:]:
             f.unlink()
         frame_files = frame_files[:24]
-
-        # Clean up the whisper .txt duplicate if needed
-        if transcript_file.exists() and transcript_file.name != "transcript.txt":
-            transcript_file.unlink()
 
         # Remove uploaded video to save disk
         video_path.unlink(missing_ok=True)
