@@ -31,6 +31,9 @@ OUTPUTS.mkdir(parents=True, exist_ok=True)
 
 jobs: dict[str, queue.Queue] = {}
 
+NO_AUDIO_TRACK_MESSAGE = "[No audio track detected in this video.]"
+NO_SPEECH_DETECTED_MESSAGE = "[Audio was present but no speech was detected. The video may be music-only, too noisy, or in a language Whisper could not recognize.]"
+
 
 @app.route("/")
 def index():
@@ -69,7 +72,7 @@ import urllib.error
 
 def _make_summary(transcript: str) -> str:
     """Generate a 5-7 word article-style title. Uses local LLM, falls back to heuristic."""
-    if not transcript or transcript == "No audio detected.":
+    if not transcript or transcript in (NO_AUDIO_TRACK_MESSAGE, NO_SPEECH_DETECTED_MESSAGE):
         return "No audio"
 
     title = _llm_title(transcript)
@@ -178,12 +181,18 @@ def process_video(job_id, video_path, original_name, model):
         )
 
         transcript = ""
-        if audio_result.returncode == 0 and wav_path.exists() and wav_path.stat().st_size > 1000:
+        transcript_text = NO_AUDIO_TRACK_MESSAGE
+        has_audio_track = (
+            audio_result.returncode == 0
+            and wav_path.exists()
+            and wav_path.stat().st_size > 1000
+        )
+        if has_audio_track:
             # Transcribe the extracted audio
             q.put({"status": "transcribing", "message": f"Transcribing with whisper-{model}..."})
             rc, stdout, stderr = _run_with_heartbeat(
                 [WHISPER, str(wav_path), "--model", model, "--output_dir", str(out_dir),
-                 "--output_format", "txt", "--language", "en"],
+                 "--output_format", "txt"],
                 q, f"Transcribing with whisper-{model}",
             )
             if rc != 0:
@@ -194,10 +203,15 @@ def process_video(job_id, video_path, original_name, model):
             if transcript_file.exists():
                 transcript_file.unlink()
 
+            if transcript:
+                transcript_text = transcript
+            else:
+                transcript_text = NO_SPEECH_DETECTED_MESSAGE
+
         wav_path.unlink(missing_ok=True)
 
         # Save clean transcript
-        (out_dir / "transcript.txt").write_text(transcript or "No audio detected.")
+        (out_dir / "transcript.txt").write_text(transcript_text)
 
         # Extract frames
         q.put({"status": "frames", "message": "Extracting key frames..."})
@@ -229,22 +243,21 @@ def process_video(job_id, video_path, original_name, model):
         video_path.unlink(missing_ok=True)
 
         duration_fmt = f"{int(duration // 60)}:{int(duration % 60):02d}"
-        transcript_text = transcript or "No audio detected."
         summary = _make_summary(transcript_text)
         frame_names = [f.name for f in frame_files]
         frame_paths = [str(frames_dir / f.name) for f in frame_files]
 
         # Pre-build the Claude clipboard text server-side (verified paths)
         claude_lines = [
-            f"I have a video I want you to understand. First read the transcript and all the frames below, then explain what the video is about — the key concepts, techniques, or ideas being shown. After your summary, ask me what I'd like to do with this information.",
+            f"I have a video I want you to understand. Use the Read tool on each frame path listed below (paths are in backticks), then combine the visual evidence with the transcript to explain what the video is about — the key concepts, techniques, or ideas being shown. After your summary, ask me what I'd like to do with this information.",
             "",
             f"Video: {original_name} ({duration_fmt})",
             "",
             "## Transcript",
             transcript_text,
             "",
-            f"## Key Frames ({len(frame_files)} — read each one)",
-        ] + [f"read {p}" for p in frame_paths]
+            f"## Key Frames ({len(frame_files)} total):",
+        ] + [f"- Frame {i:02d}: `{p}`" for i, p in enumerate(frame_paths, start=1)]
 
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
 

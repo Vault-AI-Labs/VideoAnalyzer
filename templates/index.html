@@ -863,16 +863,16 @@ function copyForClaude() {
   if (!text) {
     // Fallback for old jobs without pre-built prompt
     const dir = currentData.output_dir || '';
-    const framePaths = (currentData.frames || []).map(f => 'read ' + dir + '/frames/' + f);
+    const framePaths = (currentData.frames || []).map((f, i) => '- Frame ' + String(i + 1).padStart(2, '0') + ': `' + dir + '/frames/' + f + '`');
     text = [
-      'I have a video I want you to understand. First read the transcript and all the frames below, then explain what the video is about — the key concepts, techniques, or ideas being shown. After your summary, ask me what I\'d like to do with this information.',
+      'I have a video I want you to understand. Use the Read tool on each frame path listed below (paths are in backticks), then combine the visual evidence with the transcript to explain what the video is about — the key concepts, techniques, or ideas being shown. After your summary, ask me what I\'d like to do with this information.',
       '',
       'Video: ' + currentData.original_name + ' (' + currentData.duration_fmt + ')',
       '',
       '## Transcript',
       currentData.transcript,
       '',
-      '## Key Frames (' + currentData.frame_count + ' — read each one)',
+      '## Key Frames (' + currentData.frame_count + ' total):',
     ].concat(framePaths).join('\n');
   }
   navigator.clipboard.writeText(text);
