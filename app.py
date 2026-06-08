@@ -18,7 +18,20 @@ app = Flask(__name__)
 # Resolve binary paths — uv run may not inherit the full shell PATH
 import shutil
 
-_SEARCH_PATHS = os.environ.get("PATH", "") + ":/opt/homebrew/bin:/usr/local/bin"
+_SEARCH_PATHS = ":".join(
+    p for p in [
+        os.environ.get("PATH", ""),
+        "/opt/homebrew/bin",
+        "/opt/homebrew/sbin",
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+        "/usr/sbin",
+        "/sbin",
+    ]
+    if p
+)
+os.environ["PATH"] = _SEARCH_PATHS
 FFPROBE = shutil.which("ffprobe", path=_SEARCH_PATHS) or "ffprobe"
 FFMPEG = shutil.which("ffmpeg", path=_SEARCH_PATHS) or "ffmpeg"
 WHISPER = shutil.which("whisper", path=_SEARCH_PATHS) or "whisper"
@@ -199,7 +212,13 @@ def process_video(job_id, video_path, original_name, model):
                 raise RuntimeError(f"Whisper failed: {stderr[-500:].decode(errors='replace')}")
 
             transcript_file = out_dir / "audio.txt"
-            transcript = transcript_file.read_text().strip() if transcript_file.exists() else ""
+            if not transcript_file.exists():
+                whisper_output = (stderr + stdout)[-1000:].decode(errors="replace").strip()
+                raise RuntimeError(
+                    "Whisper did not create a transcript file."
+                    + (f" Output: {whisper_output}" if whisper_output else "")
+                )
+            transcript = transcript_file.read_text().strip()
             if transcript_file.exists():
                 transcript_file.unlink()
 

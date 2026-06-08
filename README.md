@@ -67,11 +67,11 @@ cd VideoAnalyzer
 
 Opens at `http://localhost:7745`. Drop a video and go.
 
-> **Note:** The app auto-discovers `ffprobe`, `ffmpeg`, and `whisper` binaries at startup, including from `/opt/homebrew/bin` and `/usr/local/bin`. This means it works correctly under `uv run` even when the shell PATH isn't fully inherited.
+> **Note:** The app auto-discovers `ffprobe`, `ffmpeg`, and `whisper` binaries at startup, including from `/opt/homebrew/bin` and `/usr/local/bin`, and exports that PATH for child tools. This matters when launching from Finder because Whisper internally calls `ffmpeg` by name.
 
 ### macOS Desktop App
 
-Double-click `VideoAnalyzer.app` on your Desktop (if you've built the launcher).
+Double-click `VideoAnalyzer.app` or `VideoTranscriber.app` on your Desktop if you've built the launcher. The launcher starts the local Flask server and opens the browser.
 
 ## How It Works
 
@@ -89,6 +89,22 @@ Double-click `VideoAnalyzer.app` on your Desktop (if you've built the launcher).
 8. **Ready** — Copy for Claude, review the transcript, or browse frames
 
 Long-running transcriptions send heartbeat events every 30s to keep the SSE connection alive — no timeouts on big videos.
+
+## Troubleshooting
+
+### Transcript says "Audio was present but no speech was detected"
+
+If the video clearly has spoken audio, first make sure both tools are installed:
+
+```bash
+brew install openai-whisper ffmpeg
+```
+
+Finder-launched macOS apps do not inherit your full shell PATH. VideoAnalyzer now exports Homebrew and system binary paths before running Whisper so Whisper can find its own `ffmpeg` subprocess. If you still see this message after updating, quit the running local server and reopen the desktop app so it reloads the latest `app.py`.
+
+### App opens but uses an old result
+
+Processed videos are stored in `~/.video-transcriber/outputs/<job_id>/`. Results generated before a fix are not rewritten automatically; drop the source video into the app again to regenerate the transcript and frames.
 
 ## Stack
 
