@@ -611,3 +611,16 @@ class ThinkingOff(unittest.TestCase):
         research._chat([{"role": "user", "content": "x"}], opener=opener)
         self.assertEqual(seen.get("reasoning_effort"), "none")
         self.assertEqual(seen.get("max_tokens"), 4000)
+
+    def test_roundup_videos_cover_every_item_and_phone_links_use_the_small_speech_model(self):
+        # A three-release news roundup was saved as a lesson about only one of them (2026-10-17).
+        for words in ("news roundup", "covers ALL of them", "at least one point per item", "tools lists every one",
+                      "Speech-to-text often misspells names"):
+            self.assertIn(words, research.SYSTEM)
+        sent = []
+        def opener(request, timeout=None):
+            sent.append(json.loads(request.data))
+            return Reply({"choices": [{"message": {"content": json.dumps(GOOD)}}]})
+        research.analyze("Three releases today: mu spark, Neymotron 3.5 and bonds.", {"title": "Muse Spark, Nemotron 3.5, Bonsai"}, opener=opener)
+        self.assertIn("covers ALL of them", sent[0]["messages"][0]["content"])
+        self.assertEqual(research.PHONE_MODEL, "small")

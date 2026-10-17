@@ -55,7 +55,7 @@ ALLOWED_HOSTS = {
 } | {h.strip().lower() for h in os.environ.get("VA_EXTRA_HOSTS", "").split(",") if h.strip()}
 
 PHONE_POLL = int(os.environ.get("VA_INBOX_POLL", "20"))
-PHONE_MODEL = os.environ.get("VA_PHONE_WHISPER_MODEL", "base")
+PHONE_MODEL = os.environ.get("VA_PHONE_WHISPER_MODEL", "small")   # "base" misheard product names ("mu spark" for Muse Spark)
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".mkv"}
 
 CATEGORIES = ("AI agents", "Video & motion", "Design", "Dev tooling", "Marketing", "Sales", "Operations", "Other")
@@ -212,7 +212,7 @@ scroll-driven motion websites → mobile → QA → publish. Also: an admin work
 voice), outreach email, and a private local AI stack (Qwen and GLM models on a Mac Studio). We value tools that save
 production hours, raise visual quality, or let local agents do more of the work, without sending client data to the cloud."""
 
-SYSTEM = """You turn a short tutorial video into a research lesson for a studio's knowledge base, and judge whether it is worth adopting.
+SYSTEM = """You turn a short video (a tutorial, a demo, or a news roundup) into a research lesson for a studio's knowledge base, and judge whether it is worth adopting.
 Answer with ONE JSON object only, no prose:
 {"lesson_name": "5-9 words, specific, names the tool or technique",
  "summary": "3-6 sentences: what is taught, how it works, what you would need",
@@ -225,6 +225,12 @@ Answer with ONE JSON object only, no prose:
    "rationale": "2-4 sentences, honest about hype, cost, risk, privacy (client data must stay local)",
    "effort": "S" | "M" | "L",
    "implementation_steps": ["up to 6 concrete steps to try it in our stack"]}}
+If the video covers several tools or releases (a roundup), the lesson covers ALL of them: lesson_name names the topic and the
+items (e.g. "Local AI roundup: Muse Spark, Nemotron 3.5, Bonsai 2B"), the summary gives each item at least one sentence,
+key_points has at least one point per item, and tools lists every one. Judge the recommendation on the item most useful to
+our production and name it in production_fit.
+Speech-to-text often misspells names. Correct a name only when the caption, hashtags or pictures show the right spelling;
+otherwise keep the transcript's spelling.
 If the video is mostly hype with no usable technique, say so and use "skip". Never invent tools that were not mentioned or shown.""" % json.dumps(list(CATEGORIES))
 
 
