@@ -55,7 +55,7 @@ ALLOWED_HOSTS = {
 } | {h.strip().lower() for h in os.environ.get("VA_EXTRA_HOSTS", "").split(",") if h.strip()}
 
 PHONE_POLL = int(os.environ.get("VA_INBOX_POLL", "20"))
-PHONE_MODEL = os.environ.get("VA_PHONE_WHISPER_MODEL", "small")   # "base" misheard product names ("mu spark" for Muse Spark)
+PHONE_MODEL = os.environ.get("VA_PHONE_WHISPER_MODEL", "base")
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".mkv"}
 
 CATEGORIES = ("AI agents", "Video & motion", "Design", "Dev tooling", "Marketing", "Sales", "Operations", "Other")
