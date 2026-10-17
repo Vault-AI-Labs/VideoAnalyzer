@@ -557,6 +557,29 @@
   .footer-links a:hover {
     color: var(--accent2);
   }
+
+  /* Research: TikTok links, queue and lesson panel */
+  .links { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 16px; margin: 16px 0; }
+  .links textarea { width: 100%; min-height: 64px; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 10px; font: inherit; font-size: 13px; resize: vertical; box-sizing: border-box; }
+  .links-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
+  .links-row .hint { color: var(--text2); font-size: 12px; flex: 1; min-width: 200px; }
+  .links-msg { font-size: 12px; margin-top: 8px; color: var(--text2); }
+  .queue-item { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; padding: 8px 0; border-top: 1px solid var(--border); }
+  .queue-item .q-url { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .queue-item.is-error .q-msg { color: var(--error); }
+  .queue-item.is-done .q-msg { color: var(--success); }
+  .lesson { border: 1px solid var(--border); border-radius: 12px; padding: 16px; margin: 16px 0; background: var(--surface); }
+  .lesson h3 { margin: 6px 0 8px; font-size: 18px; }
+  .lesson p { margin: 6px 0; font-size: 13px; line-height: 1.55; }
+  .lesson ul { margin: 6px 0; padding-left: 18px; font-size: 13px; line-height: 1.55; }
+  .lesson-thumbs { display: flex; gap: 6px; margin-bottom: 10px; }
+  .lesson-thumbs img { width: 90px; aspect-ratio: 9/16; object-fit: cover; border-radius: 6px; }
+  .pill { display: inline-block; font-size: 11px; padding: 3px 8px; border-radius: 999px; border: 1px solid var(--border); margin-right: 4px; }
+  .pill.adopt { color: var(--success); border-color: var(--success); }
+  .pill.trial { color: var(--accent); border-color: var(--accent); }
+  .lesson-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; align-items: center; }
+  .lesson-actions .export-state { font-size: 12px; color: var(--text2); }
+  @media (max-width: 640px) { header, .result-header, .status-bar { flex-wrap: wrap; } .result-actions { flex-wrap: wrap; } }
 </style>
 </head>
 <body>
@@ -583,6 +606,18 @@
     <div class="dropzone-icon">&#9654;</div>
     <h2>Drop a video here</h2>
     <p>MP4, MOV, WebM, MKV — any video file</p>
+  </div>
+
+  <div class="links" id="links">
+    <textarea id="linkInput" placeholder="Paste TikTok links (one per line), e.g. from Share → Copy link on a saved video"></textarea>
+    <div class="links-row">
+      <button class="btn btn-primary" onclick="queueLinks()">Add links</button>
+      <label class="btn" for="exportInput">Import TikTok data file</label>
+      <input type="file" id="exportInput" accept=".json,application/json" hidden onchange="importExport(this.files[0])">
+      <span class="hint">Data file: TikTok → Settings → Account → Download your data (JSON). Every saved video is queued; already-saved ones are skipped.</span>
+    </div>
+    <div class="links-msg" id="linksMsg"></div>
+    <div id="queueList"></div>
   </div>
 
   <div class="processing" id="processing">
@@ -623,6 +658,8 @@
       <button class="status-btn" data-status="delete" onclick="setStatus('delete')">Delete</button>
       <span class="status-date" id="statusDate"></span>
     </div>
+
+    <div class="lesson" id="lessonBox" hidden></div>
 
     <div class="transcript-section">
       <div class="section-title">Transcript</div>
@@ -772,11 +809,9 @@ function showResult(data, jobId) {
   result.classList.add('active');
 
   const title = data.summary || data.original_name;
-  document.getElementById('resultMeta').innerHTML =
-    `<span>${title}</span>` +
-    `<span>${data.duration_fmt}</span>` +
-    `<span>whisper-${data.model}</span>` +
-    `<span>${data.frame_count} frames</span>`;
+  const meta = document.getElementById('resultMeta');
+  meta.replaceChildren(...[title, data.duration_fmt, 'whisper-' + data.model, data.frame_count + ' frames'].map(t => { const s = document.createElement('span'); s.textContent = t; return s; }));
+  renderLesson(data, jobId);
 
   // Status bar
   updateStatusUI(data.item_status || 'new', data.status_date || data.created_at || '');
@@ -962,10 +997,10 @@ async function loadHistory() {
       metaSpan.appendChild(durSpan);
       metaSpan.appendChild(sel);
 
-      if (item.frames && item.frames.length) {
+      if ((item.thumbnails && item.thumbnails.length) || (item.frames && item.frames.length)) {
         const thumb = document.createElement('img');
         thumb.className = 'history-thumb';
-        thumb.src = `/api/frames/${item.job_id}/${item.frames[0]}`;
+        thumb.src = item.thumbnails && item.thumbnails.length ? `/api/thumbs/${item.job_id}/${item.thumbnails[0]}` : `/api/frames/${item.job_id}/${item.frames[0]}`;
         thumb.alt = '';
         thumb.loading = 'lazy';
         div.appendChild(thumb);
@@ -983,6 +1018,83 @@ async function loadHistory() {
       list.appendChild(div);
     });
   } catch {}
+}
+
+// ---- Research: links, queue, lesson ------------------------------------------------------------
+function el(tag, cls, text) { const n = document.createElement(tag); if (cls) n.className = cls; if (text !== undefined) n.textContent = text; return n; }
+
+function watchQueued(item) {
+  const row = el('div', 'queue-item'), url = el('span', 'q-url', item.url), msg = el('span', 'q-msg', 'Queued');
+  row.append(url, msg); document.getElementById('queueList').append(row);
+  const source = new EventSource(`/api/stream/${item.job_id}`);
+  source.onmessage = e => {
+    const data = JSON.parse(e.data);
+    msg.textContent = data.status === 'complete' ? 'Saved: ' + (data.data.summary || 'done') + (data.data.export && data.data.export.ok ? ' → BadMonkey' : '') : data.message;
+    if (data.status === 'complete') { row.classList.add('is-done'); source.close(); loadHistory(); }
+    if (data.status === 'error') { row.classList.add('is-error'); source.close(); }
+  };
+  source.onerror = () => { source.close(); if (!row.classList.contains('is-done')) msg.textContent += ' (reload to check)'; };
+}
+
+async function queueLinks() {
+  const text = document.getElementById('linkInput').value;
+  const out = document.getElementById('linksMsg');
+  const res = await fetch('/api/ingest-url', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: text, model: document.getElementById('model').value }) });
+  const data = await res.json();
+  if (!res.ok) { out.textContent = data.error || 'Could not queue those links.'; return; }
+  out.textContent = `${data.queued.length} queued` + (data.skipped.length ? `, ${data.skipped.length} already saved` : '') + (data.rejected.length ? `, ${data.rejected.length} not supported` : '') + '.';
+  data.queued.forEach(watchQueued);
+  document.getElementById('linkInput').value = '';
+}
+
+async function importExport(file) {
+  if (!file) return;
+  const out = document.getElementById('linksMsg');
+  const form = new FormData(); form.append('file', file); form.append('model', document.getElementById('model').value); form.append('limit', '50');
+  out.textContent = 'Reading your TikTok data file...';
+  const res = await fetch('/api/import-tiktok', { method: 'POST', body: form });
+  const data = await res.json();
+  document.getElementById('exportInput').value = '';
+  if (!res.ok) { out.textContent = data.error; return; }
+  out.textContent = `Found ${data.found} saved videos: ${data.queued.length} queued, ${data.already_saved} already saved` + (data.left_for_later ? `, ${data.left_for_later} left for the next import (50 at a time).` : '.');
+  data.queued.forEach(watchQueued);
+}
+
+const verdictText = { adopt: 'Adopt', trial: 'Try it', watch: 'Watch', skip: 'Skip' };
+
+function renderLesson(data, jobId) {
+  const box = document.getElementById('lessonBox');
+  box.replaceChildren();
+  const a = data.analysis;
+  if (!a && !(data.thumbnails || []).length) { box.hidden = true; return; }
+  box.hidden = false;
+  if ((data.thumbnails || []).length) {
+    const strip = el('div', 'lesson-thumbs');
+    data.thumbnails.forEach(t => { const img = el('img'); img.src = `/api/thumbs/${jobId}/${t}`; img.alt = ''; img.onclick = () => openLightbox(img.src); strip.append(img); });
+    box.append(strip);
+  }
+  if (a && a.ok) {
+    const r = a.recommendation || {};
+    const pills = el('div');
+    pills.append(el('span', 'pill ' + (r.verdict || ''), verdictText[r.verdict] || 'Not rated'));
+    if (r.value_score != null) pills.append(el('span', 'pill', r.value_score + '/10 value'));
+    if (r.effort) pills.append(el('span', 'pill', 'Effort ' + r.effort));
+    pills.append(el('span', 'pill', a.category || 'Other'));
+    box.append(pills, el('h3', '', a.lesson_name), el('p', '', a.summary));
+    if (r.production_fit) box.append(el('p', '', 'Fit: ' + r.production_fit));
+    if (r.rationale) box.append(el('p', '', 'Why: ' + r.rationale));
+    if ((a.tools || []).length) box.append(el('p', '', 'Tools: ' + a.tools.join(', ')));
+  } else if (a) {
+    box.append(el('p', '', 'The local model could not analyse this lesson: ' + (a.error || 'unknown error') + '. Start it, then Re-analyse.'));
+  }
+  const actions = el('div', 'lesson-actions');
+  const again = el('button', 'btn', 'Re-analyse');
+  again.onclick = async () => { again.disabled = true; again.textContent = 'Analysing...'; const res = await fetch('/api/analyze/' + jobId, { method: 'POST' }); const meta = await res.json(); again.disabled = false; again.textContent = 'Re-analyse'; if (res.ok) { currentData = Object.assign(meta, { job_id: jobId }); showResult(currentData, jobId); loadHistory(); } };
+  const send = el('button', 'btn btn-primary', 'Send to BadMonkey');
+  const state = el('span', 'export-state', data.export ? (data.export.ok ? 'Saved to BadMonkey Research ' + (data.export.at || '') : 'Not sent: ' + data.export.error) : '');
+  send.onclick = async () => { send.disabled = true; const res = await fetch('/api/export/' + jobId, { method: 'POST' }); const result = await res.json(); send.disabled = false; data.export = result; state.textContent = result.ok ? 'Saved to BadMonkey Research ' + (result.at || '') : 'Not sent: ' + result.error; };
+  actions.append(again, send, state);
+  box.append(actions);
 }
 
 loadHistory();

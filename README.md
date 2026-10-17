@@ -40,6 +40,38 @@ This turns passive video consumption into active creation. Every tutorial, every
 - **Copy for Claude** — One click produces a complete prompt with transcript + `read` commands for every frame
 - **Zero Setup** — Single `uv run` command, no virtual environments, no build step
 
+## Saved TikToks → research lessons
+
+VideoAnalyzer can also take **links** instead of files and turn each video into a rated lesson:
+
+- **Paste TikTok links** (one per line) or **Import TikTok data file** (TikTok → Settings → Account → Download your data →
+  JSON; every Favorite/saved video is queued, 50 per import, already-saved ones skipped). Needs `brew install yt-dlp`.
+  For videos that need sign-in, set `VA_YTDLP_COOKIES_BROWSER=safari` (or `chrome`).
+- **Three thumbnails** per video (15 %, 50 %, 85 %) so lessons are easy to recognise.
+- **Lesson analysis by a local model** (OpenAI-compatible endpoint: Ollama, vllm-mlx, LM Studio — never a hosted API):
+  lesson name, summary, key points, tools, category, and a recommendation (adopt / trial / watch / skip, value 0–10,
+  where it fits your production flow, effort, steps). Thumbnails are sent as images when the model supports vision.
+  Describe your production flow in a file and point `VA_PRODUCTION_CONTEXT` at it.
+- **Send to BadMonkey**: exports the lesson to the BadMonkey workspace's Research module (automatic when configured).
+
+Settings go in the environment or `~/.video-transcriber/config.json` (Finder launches have no shell environment):
+
+| Setting | Default |
+|---|---|
+| `VA_LLM_URL` / `VA_LLM_MODEL` | `http://127.0.0.1:11434/v1` / `qwen3.8:27b` |
+| `VA_LLM_VISION` | `1` |
+| `VA_PRODUCTION_CONTEXT` | built-in description |
+| `VA_BADMONKEY_URL` / `VA_BADMONKEY_KEY` | `http://127.0.0.1:4180` / — (the workspace's `BM_RESEARCH_KEY`) |
+| `VA_AUTO_EXPORT` | `1` |
+| `VA_DATA_DIR` | `~/.video-transcriber` |
+| `VA_WATCH_DIR` | iCloud Drive → `BadMonkey Inbox` (video files dropped there are processed, then moved to `Done`); `off` disables |
+| `VA_INBOX_POLL` | `20` seconds between checks of the BadMonkey phone inbox (links shared from the iPhone) |
+| `VA_PHONE_WHISPER_MODEL` | `base` (Whisper model for phone links and watched files) |
+
+If the model is down the video is still saved; press **Re-analyse** later.
+
+**From the phone:** links shared with the BadMonkey "Send to Research" iPhone Shortcut wait in the workspace's phone inbox; VideoAnalyzer pulls them automatically and reports each one back as saved or failed. Video files saved to iCloud Drive → BadMonkey Inbox are picked up too.
+
 ## Quick Start
 
 ### Prerequisites
@@ -115,6 +147,8 @@ Processed videos are stored in `~/.video-transcriber/outputs/<job_id>/`. Results
 | Transcription | OpenAI Whisper (local) |
 | Frame extraction | ffmpeg |
 | Title generation | Ollama gemma3:4b (optional, heuristic fallback) |
+| Link downloads | yt-dlp (optional) |
+| Lesson analysis | Any local OpenAI-compatible model (optional; default Ollama `qwen3.8:27b`) |
 | Dependencies | `uv run --with flask` (zero venv) |
 
 ## API
@@ -127,6 +161,13 @@ Processed videos are stored in `~/.video-transcriber/outputs/<job_id>/`. Results
 | GET | `/api/frames/<job_id>/<file>` | Serve extracted frame |
 | GET | `/api/history` | List past transcriptions |
 | PUT | `/api/status/<job_id>` | Update item status |
+| POST | `/api/ingest-url` | Queue links: `{"url": "one or more links", "model": "base"}` |
+| POST | `/api/import-tiktok` | Queue saved videos from TikTok's data-download JSON (multipart `file`) |
+| GET | `/api/queue` | Jobs waiting for download |
+| GET | `/api/thumbs/<job_id>/<file>` | Serve a thumbnail |
+| POST | `/api/analyze/<job_id>` | Re-run the local model on a saved transcript |
+| POST | `/api/export/<job_id>` | Send the lesson to BadMonkey Research |
+| GET | `/api/health` | Tools present, queue, disk, model and export settings (used by health agents) |
 
 ## Project Structure
 
@@ -134,15 +175,18 @@ Processed videos are stored in `~/.video-transcriber/outputs/<job_id>/`. Results
 ~/.video-transcriber/           # Runtime data
   ├── port                      # Current port
   ├── uploads/                  # Temporary (deleted after processing)
+  ├── config.json               # Optional settings (see above)
   └── outputs/<job_id>/         # Persisted results
-      ├── metadata.json         # All job data + Claude prompt
+      ├── metadata.json         # All job data + Claude prompt, source, analysis, export state
+      ├── thumbs/thumb_*.jpg    # Three lesson thumbnails
       ├── transcript.txt        # Clean transcript
       └── frames/frame_*.jpg    # Extracted key frames
 ```
 
 ## Contributing
 
-PRs welcome. Keep it simple — this is a single-file Flask app by design.
+PRs welcome. Keep it simple — `app.py` is the Flask app; `research.py` holds the optional links/analysis/export add-on.
+Tests: `uv run --with flask python -m unittest discover -s tests`.
 
 ## License
 
