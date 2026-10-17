@@ -612,6 +612,16 @@ class ThinkingOff(unittest.TestCase):
         self.assertEqual(seen.get("reasoning_effort"), "none")
         self.assertEqual(seen.get("max_tokens"), 4000)
 
+    def test_fast_whisper_is_used_only_when_its_model_file_and_cli_exist(self):
+        with tempfile.TemporaryDirectory() as folder:
+            cli = Path(folder) / "whisper-cli"; cli.write_text("#!/bin/sh\n"); cli.chmod(0o755)
+            models = Path(folder) / "models"; models.mkdir()
+            with mock.patch.object(research, "WHISPER_CPP_MODELS", models), mock.patch.dict(os.environ, {"PATH": folder}):
+                self.assertIsNone(research.fast_whisper("small"))   # no model file: the CPU Whisper is used
+                (models / "ggml-small.bin").write_bytes(b"x")
+                self.assertEqual(research.fast_whisper("small"), (str(cli), models / "ggml-small.bin"))
+                self.assertIsNone(research.fast_whisper("base"))
+
     def test_roundup_videos_cover_every_item(self):
         # A three-release news roundup was saved as a lesson about only one of them (2026-10-17).
         for words in ("news roundup", "covers ALL of them", "at least one point per item", "tools lists every one",

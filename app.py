@@ -617,9 +617,11 @@ def process_video(job_id, video_path, original_name, model, source=None, export=
         if has_audio_track:
             # Transcribe the extracted audio
             q.put({"status": "transcribing", "message": f"Transcribing with whisper-{model}..."})
+            fast = research.fast_whisper(model)
+            command = ([fast[0], "-m", str(fast[1]), "-f", str(wav_path), "-l", "auto", "-otxt", "-of", str(out_dir / "audio"), "-np"]
+                       if fast else [WHISPER, str(wav_path), "--model", model, "--output_dir", str(out_dir), "--output_format", "txt"])
             rc, stdout, stderr = _run_with_heartbeat(
-                [WHISPER, str(wav_path), "--model", model, "--output_dir", str(out_dir),
-                 "--output_format", "txt"],
+                command,
                 q, f"Transcribing with whisper-{model}", timeout=transcribe_timeout(duration), cancel_event=cancel_event,
             )
             _raise_if_inbox_abandoned(cancel_event)

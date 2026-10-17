@@ -55,7 +55,19 @@ ALLOWED_HOSTS = {
 } | {h.strip().lower() for h in os.environ.get("VA_EXTRA_HOSTS", "").split(",") if h.strip()}
 
 PHONE_POLL = int(os.environ.get("VA_INBOX_POLL", "20"))
-PHONE_MODEL = os.environ.get("VA_PHONE_WHISPER_MODEL", "base")
+WHISPER_CPP_MODELS = Path(os.environ.get("VA_WHISPER_CPP_MODELS", str(Path.home() / ".cache" / "whisper-cpp")))
+
+
+def fast_whisper(model):
+    """whisper.cpp on the Apple GPU when its model file is present: Whisper small transcribed 2 minutes of speech in 12 s
+    on a busy Studio, where the CPU Whisper took 22 s for base and over 10 minutes for small."""
+    cli = shutil.which("whisper-cli", path=os.environ.get("PATH", "") + ":/opt/homebrew/bin:/usr/local/bin")
+    weights = WHISPER_CPP_MODELS / f"ggml-{model}.bin"
+    return (cli, weights) if cli and weights.is_file() else None
+
+
+# Phone links: small (spells product names far better than base) when the fast engine has it, else base.
+PHONE_MODEL = os.environ.get("VA_PHONE_WHISPER_MODEL") or ("small" if fast_whisper("small") else "base")
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".mkv"}
 
 CATEGORIES = ("AI agents", "Video & motion", "Design", "Dev tooling", "Marketing", "Sales", "Operations", "Other")
