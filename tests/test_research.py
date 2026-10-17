@@ -17,7 +17,7 @@ from pathlib import Path
 from unittest import mock
 
 TEMP = tempfile.TemporaryDirectory()
-os.environ.update(VA_DATA_DIR=TEMP.name, VA_BADMONKEY_URL="http://127.0.0.1:4180", VA_BADMONKEY_KEY="k" * 40, VA_LLM_URL="http://127.0.0.1:11434/v1", VA_LLM_MODEL="qwen-test")
+os.environ.update(VA_BACKGROUND="0", VA_DATA_DIR=TEMP.name, VA_BADMONKEY_URL="http://127.0.0.1:4180", VA_BADMONKEY_KEY="k" * 40, VA_LLM_URL="http://127.0.0.1:11434/v1", VA_LLM_MODEL="qwen-test")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import research  # noqa: E402
 import app  # noqa: E402
@@ -164,6 +164,62 @@ class Routes(unittest.TestCase):
     def test_ids_are_validated(self):
         self.assertEqual(self.client.post("/api/export/..%2f..").status_code, 404)
         self.assertEqual(self.client.get("/api/thumbs/aaaaaaaa/../metadata.json").status_code, 404)
+
+
+class Phone(unittest.TestCase):
+    def test_inbox_calls_use_the_machine_routes(self):
+        sent = []
+        def opener(request, timeout=None):
+            sent.append((request.full_url, request.get_header("X-bm-research-key"), json.loads(request.data)))
+            return Reply({"item": {"id": "i" * 40, "url": "https://vm.tiktok.com/ZMabc/"}})
+        self.assertEqual(research.inbox_next(opener=opener)["url"], "https://vm.tiktok.com/ZMabc/")
+        research.inbox_report("i" * 40, "done", module_id="m" * 40, job="abcd1234", opener=opener)
+        self.assertEqual(sent[0][0], "http://127.0.0.1:4180/api/v1/research/machine/inbox/next")
+        self.assertEqual(sent[1][0], "http://127.0.0.1:4180/api/v1/research/machine/inbox/" + "i" * 40)
+        self.assertEqual(sent[1][2]["module_id"], "m" * 40)
+        self.assertEqual(sent[0][1], "k" * 40)
+        research.inbox_report("x", "failed", opener=lambda *a, **k: (_ for _ in ()).throw(ConnectionRefusedError()))   # never raises
+
+    def test_watched_folder_waits_for_sync_and_ignores_placeholders(self):
+        with tempfile.TemporaryDirectory() as folder:
+            clip = Path(folder) / "screen recording.mov"
+            clip.write_bytes(b"x" * 100)
+            (Path(folder) / ".other.mov.icloud").write_bytes(b"p")
+            (Path(folder) / "notes.txt").write_text("no")
+            seen = {}
+            self.assertEqual(research.ready_files(folder, seen), [])          # first sight
+            self.assertEqual(research.ready_files(folder, seen), [])          # same size but just modified
+            old = time.time() - 30
+            os.utime(clip, (old, old))
+            self.assertEqual(research.ready_files(folder, seen), [(clip, 100)])
+            research.file_done(clip)
+            self.assertFalse(clip.exists())
+            self.assertTrue((Path(folder) / "Done" / "screen recording.mov").exists())
+        with mock.patch.dict(os.environ, {"VA_WATCH_DIR": "off"}):
+            self.assertIsNone(research.watch_dir())
+
+    def test_worker_reports_phone_links_and_files_back_to_the_inbox(self):
+        reports = []
+        def fake_process(job_id, video_path, name, model, source=None, export=True):
+            out = app.OUTPUTS / job_id
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "metadata.json").write_text(json.dumps({"export": {"ok": True, "module_id": "m" * 40}, "source": source}))
+            Path(video_path).unlink()
+        def fail_download(*a, **k):
+            raise RuntimeError("Download failed: This video is private")
+        with tempfile.TemporaryDirectory() as folder:
+            clip = Path(folder) / "clip.mp4"
+            clip.write_bytes(b"video")
+            with mock.patch.object(app, "process_video", fake_process), mock.patch.object(research, "download", fail_download), \
+                 mock.patch.object(research, "inbox_report", lambda *a, **k: reports.append((a, k))):
+                app._enqueue_url("", "tiny", True, inbox_id="f" * 40, file=clip)
+                app._enqueue_url("https://www.tiktok.com/@_/video/7350000000000000077", "tiny", True, inbox_id="u" * 40)
+                app.url_queue.join()
+            self.assertTrue((Path(folder) / "Done" / "clip.mp4").exists())
+        self.assertEqual(reports[0][0][:2], ("f" * 40, "done"))
+        self.assertEqual(reports[0][1]["module_id"], "m" * 40)
+        self.assertEqual(reports[1][0][:2], ("u" * 40, "failed"))
+        self.assertIn("private", reports[1][1]["error"])
 
 
 @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "needs ffmpeg")

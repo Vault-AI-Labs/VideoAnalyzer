@@ -105,32 +105,97 @@ waiting: list[str] = []
 waiting_lock = threading.Lock()
 
 
-def _enqueue_url(url, model, export=True):
+def _enqueue_url(url, model, export=True, inbox_id=None, file=None):
+    """Queue a link (or, with file=, a video file from the watched folder). One job runs at a time."""
     job_id = uuid.uuid4().hex[:8]
     jobs[job_id] = queue.Queue()
     with waiting_lock:
         waiting.append(job_id)
         position = len(waiting)
     jobs[job_id].put({"status": "queued", "message": f"Queued ({position} in line)..."})
-    url_queue.put((job_id, url, model, export))
+    url_queue.put((job_id, url, model, export, inbox_id, file))
     return job_id
+
+
+def _outcome(job_id):
+    """(ok, module_id, error) for a finished job, read from what it saved."""
+    meta_file = OUTPUTS / job_id / "metadata.json"
+    if not meta_file.exists():
+        return False, "", "VideoAnalyzer could not process this video (see its window for the error)."
+    export = json.loads(meta_file.read_text()).get("export") or {}
+    if export.get("ok"):
+        return True, export.get("module_id", ""), ""
+    return False, "", "Processed, but not saved to Research: " + export.get("error", "export is off")
 
 
 def _url_worker():
     while True:
-        job_id, url, model, export = url_queue.get()
+        job_id, url, model, export, inbox_id, file = url_queue.get()
         with waiting_lock:
             if job_id in waiting:
                 waiting.remove(job_id)
         q = jobs[job_id]
+        failure = ""
         try:
-            q.put({"status": "downloading", "message": "Downloading the video..."})
-            video_path, source = research.download(YTDLP, url, UPLOADS, job_id)
-            process_video(job_id, video_path, source.get("title") or url, model, source=source, export=export)
+            if file:
+                video_path = UPLOADS / f"{job_id}{file.suffix.lower()}"
+                shutil.copy2(file, video_path)
+                research.file_done(file)
+                process_video(job_id, video_path, file.name, model, source={"platform": "upload", "title": file.stem[:200]}, export=export)
+            else:
+                q.put({"status": "downloading", "message": "Downloading the video..."})
+                video_path, source = research.download(YTDLP, url, UPLOADS, job_id)
+                process_video(job_id, video_path, source.get("title") or url, model, source=source, export=export)
         except Exception as e:
-            q.put({"status": "error", "message": str(e)[:500]})
+            failure = str(e)[:500]
+            q.put({"status": "error", "message": failure})
         finally:
+            if inbox_id:
+                ok, module_id, error = _outcome(job_id)
+                research.inbox_report(inbox_id, "done" if ok else "failed", module_id=module_id, error=failure or error, job=job_id)
             url_queue.task_done()
+
+
+# ---- phone inbox (links shared from the iPhone, held by the BadMonkey workspace) and the watched folder ----
+phone = {"enabled": False, "last_poll": 0, "last_error": "", "watch_dir": ""}
+
+
+def _phone_poller():
+    """Pull links sent from the phone. Takes one at a time so the workspace shows what is still waiting."""
+    phone["enabled"] = research.export_configured()
+    while phone["enabled"]:
+        try:
+            if len(waiting) < 2:
+                item = research.inbox_next()
+                phone["last_poll"], phone["last_error"] = time.time(), ""
+                if item:
+                    try:
+                        link = research.normalize_url(item["url"])
+                    except ValueError as e:
+                        research.inbox_report(item["id"], "failed", error=str(e))
+                        continue
+                    _enqueue_url(link, research.PHONE_MODEL, True, inbox_id=item["id"])
+                    continue   # check for more right away
+            else:
+                phone["last_poll"] = time.time()
+        except Exception as e:   # workspace restarting or unreachable: try again shortly
+            phone["last_error"] = f"{type(e).__name__}: {e}"[:300]
+        time.sleep(research.PHONE_POLL)
+
+
+def _watch_folder():
+    folder = research.watch_dir()
+    if not folder:
+        return
+    phone["watch_dir"] = str(folder)
+    seen = {}
+    while True:
+        try:
+            for file, size in research.ready_files(folder, seen):
+                _enqueue_url("", research.PHONE_MODEL, True, file=file)
+        except OSError as e:
+            phone["last_error"] = f"watch folder: {e}"[:300]
+        time.sleep(15)
 
 
 def _queue_ticker():
@@ -146,6 +211,9 @@ def _queue_ticker():
 
 threading.Thread(target=_url_worker, daemon=True).start()
 threading.Thread(target=_queue_ticker, daemon=True).start()
+if os.environ.get("VA_BACKGROUND", "1") == "1":   # tests switch the phone poller and folder watcher off
+    threading.Thread(target=_phone_poller, daemon=True).start()
+    threading.Thread(target=_watch_folder, daemon=True).start()
 
 
 def _known_sources():
@@ -226,6 +294,8 @@ def health():
         "analysis_model": research.LLM_MODEL,
         "analysis_url": research.LLM_URL,
         "badmonkey_export": research.export_configured(),
+        "phone_inbox": {"enabled": phone["enabled"], "last_poll": phone["last_poll"], "last_error": phone["last_error"]},
+        "watch_dir": phone["watch_dir"],
     })
 
 

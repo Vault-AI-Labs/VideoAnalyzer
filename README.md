@@ -64,8 +64,13 @@ Settings go in the environment or `~/.video-transcriber/config.json` (Finder lau
 | `VA_BADMONKEY_URL` / `VA_BADMONKEY_KEY` | `http://127.0.0.1:4180` / — (the workspace's `BM_RESEARCH_KEY`) |
 | `VA_AUTO_EXPORT` | `1` |
 | `VA_DATA_DIR` | `~/.video-transcriber` |
+| `VA_WATCH_DIR` | iCloud Drive → `BadMonkey Inbox` (video files dropped there are processed, then moved to `Done`); `off` disables |
+| `VA_INBOX_POLL` | `20` seconds between checks of the BadMonkey phone inbox (links shared from the iPhone) |
+| `VA_PHONE_WHISPER_MODEL` | `base` (Whisper model for phone links and watched files) |
 
 If the model is down the video is still saved; press **Re-analyse** later.
+
+**From the phone:** links shared with the BadMonkey "Send to Research" iPhone Shortcut wait in the workspace's phone inbox; VideoAnalyzer pulls them automatically and reports each one back as saved or failed. Video files saved to iCloud Drive → BadMonkey Inbox are picked up too.
 
 ## Quick Start
 

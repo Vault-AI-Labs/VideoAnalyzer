@@ -40,6 +40,10 @@ ALLOWED_HOSTS = {
     "youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be", "instagram.com", "www.instagram.com",
 } | {h.strip().lower() for h in os.environ.get("VA_EXTRA_HOSTS", "").split(",") if h.strip()}
 
+PHONE_POLL = int(os.environ.get("VA_INBOX_POLL", "20"))
+PHONE_MODEL = os.environ.get("VA_PHONE_WHISPER_MODEL", "base")
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".mkv"}
+
 CATEGORIES = ("AI agents", "Video & motion", "Design", "Dev tooling", "Marketing", "Sales", "Operations", "Other")
 VERDICTS = ("adopt", "trial", "watch", "skip")
 TIKTOK_ID = re.compile(r"/(?:video|v|share/video)/(\d{8,25})")
@@ -115,7 +119,10 @@ def download(ytdlp, url, uploads, job_id, run=subprocess.run):
            "--print", "after_move:filepath", url]
     if COOKIES_BROWSER:
         cmd[1:1] = ["--cookies-from-browser", COOKIES_BROWSER]
-    result = run(cmd, capture_output=True, text=True, timeout=600)
+    try:
+        result = run(cmd, capture_output=True, text=True, timeout=600)
+    except FileNotFoundError:
+        raise RuntimeError("yt-dlp is not installed on the Studio. Run: brew install yt-dlp")
     if result.returncode != 0:
         tail = (result.stderr or "").strip().splitlines()[-1:] or ["unknown error"]
         hint = " TikTok may need you signed in: set VA_YTDLP_COOKIES_BROWSER=safari (or chrome)." if "login" in tail[0].lower() or "private" in tail[0].lower() else ""
@@ -372,3 +379,64 @@ def export(meta, out_dir, opener=urlopen):
             except Exception:
                 pass
         return {"ok": False, "error": (detail or f"{type(e).__name__}: {e}")[:300], "at": time.strftime("%Y-%m-%d %H:%M")}
+
+
+# ---- phone inbox and watched folder ---------------------------------------------------------------
+def _machine(path, body, opener=urlopen):
+    request = Request(BADMONKEY_URL + "/api/v1/research/machine/" + path, data=json.dumps(body).encode(), method="POST",
+                      headers={"Content-Type": "application/json", "X-BM-Research-Key": BADMONKEY_KEY})
+    with opener(request, timeout=30) as response:
+        return json.loads(response.read())
+
+
+def inbox_next(opener=urlopen):
+    """The oldest link shared from the phone, claimed for this VideoAnalyzer (or None)."""
+    return _machine("inbox/next", {}, opener).get("item")
+
+
+def inbox_report(item_id, status, module_id="", error="", job="", opener=urlopen):
+    try:
+        _machine("inbox/" + item_id, {"status": status, "module_id": module_id or "", "error": (error or "")[:500], "job": job}, opener)
+    except Exception:
+        pass   # the workspace's health check flags links left processing
+
+
+def watch_dir():
+    """VA_WATCH_DIR, or iCloud Drive/BadMonkey Inbox when this Mac uses iCloud Drive. VA_WATCH_DIR=off disables it."""
+    configured = os.environ.get("VA_WATCH_DIR", "")
+    if configured.lower() == "off":
+        return None
+    folder = Path(configured).expanduser() if configured else None
+    if not folder:
+        icloud = Path.home() / "Library" / "Mobile Documents" / "com~apple~CloudDocs"
+        if not icloud.is_dir():
+            return None
+        folder = icloud / "BadMonkey Inbox"
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+def ready_files(folder, seen):
+    """Video files that finished syncing: same size on two scans, untouched for 10 s, not an iCloud placeholder."""
+    ready = []
+    now = time.time()
+    for file in sorted(Path(folder).iterdir()):
+        if not file.is_file() or file.suffix.lower() not in VIDEO_EXTENSIONS or file.name.startswith("."):
+            continue
+        stat = file.stat()
+        if seen.get(file) == stat.st_size and now - stat.st_mtime > 10 and stat.st_size > 0:
+            ready.append((file, stat.st_size))
+            seen.pop(file, None)
+        else:
+            seen[file] = stat.st_size
+    return ready
+
+
+def file_done(file):
+    """Move a picked-up file to <folder>/Done so it is never processed twice (and stays yours in iCloud)."""
+    done = Path(file).parent / "Done"
+    done.mkdir(exist_ok=True)
+    target = done / Path(file).name
+    if target.exists():
+        target = done / f"{Path(file).stem}-{int(time.time())}{Path(file).suffix}"
+    Path(file).rename(target)
