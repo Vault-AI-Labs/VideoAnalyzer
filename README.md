@@ -40,19 +40,22 @@ This turns passive video consumption into active creation. Every tutorial, every
 - **Copy for Claude** — One click produces a complete prompt with transcript + `read` commands for every frame
 - **Zero Setup** — Single `uv run` command, no virtual environments, no build step
 
-## Saved TikToks → research lessons
+## Saved TikToks → R&D lessons
 
 VideoAnalyzer can also take **links** instead of files and turn each video into a rated lesson:
 
 - **Paste TikTok links** (one per line) or **Import TikTok data file** (TikTok → Settings → Account → Download your data →
   JSON; every Favorite/saved video is queued, 50 per import, already-saved ones skipped). Needs `brew install yt-dlp`.
-  For videos that need sign-in, set `VA_YTDLP_COOKIES_BROWSER=safari` (or `chrome`).
+  For videos that need sign-in, set `VA_YTDLP_COOKIES_BROWSER=safari` (or `chrome`). Each download is limited to one
+  video and 300 MB, and yt-dlp can reach the internet only through a per-download loopback proxy that rejects non-public
+  destinations. On macOS, `sandbox-exec` additionally confines yt-dlp and its children to that proxy; other platforms log
+  that the unavailable sandbox wrapper was skipped while retaining the proxy check.
 - **Three thumbnails** per video (15 %, 50 %, 85 %) so lessons are easy to recognise.
 - **Lesson analysis by a local model** (OpenAI-compatible endpoint: Ollama, vllm-mlx, LM Studio — never a hosted API):
   lesson name, summary, key points, tools, category, and a recommendation (adopt / trial / watch / skip, value 0–10,
   where it fits your production flow, effort, steps). Thumbnails are sent as images when the model supports vision.
   Describe your production flow in a file and point `VA_PRODUCTION_CONTEXT` at it.
-- **Send to BadMonkey**: exports the lesson to the BadMonkey workspace's Research module (automatic when configured).
+- **Send to BadMonkey R&D**: exports the lesson to the BadMonkey workspace's R&D module (automatic when configured).
 
 Settings go in the environment or `~/.video-transcriber/config.json` (Finder launches have no shell environment):
 
@@ -61,7 +64,7 @@ Settings go in the environment or `~/.video-transcriber/config.json` (Finder lau
 | `VA_LLM_URL` / `VA_LLM_MODEL` | `http://127.0.0.1:11434/v1` / `qwen3.8:27b` |
 | `VA_LLM_VISION` | `1` |
 | `VA_PRODUCTION_CONTEXT` | built-in description |
-| `VA_BADMONKEY_URL` / `VA_BADMONKEY_KEY` | `http://127.0.0.1:4180` / — (the workspace's `BM_RESEARCH_KEY`) |
+| `VA_BADMONKEY_URL` / `VA_BADMONKEY_KEY` | `http://127.0.0.1:4181` / — (the workspace's `BM_RESEARCH_KEY`) |
 | `VA_AUTO_EXPORT` | `1` |
 | `VA_DATA_DIR` | `~/.video-transcriber` |
 | `VA_WATCH_DIR` | iCloud Drive → `BadMonkey Inbox` (video files dropped there are processed, then moved to `Done`); `off` disables |
@@ -70,7 +73,7 @@ Settings go in the environment or `~/.video-transcriber/config.json` (Finder lau
 
 If the model is down the video is still saved; press **Re-analyse** later.
 
-**From the phone:** links shared with the BadMonkey "Send to Research" iPhone Shortcut wait in the workspace's phone inbox; VideoAnalyzer pulls them automatically and reports each one back as saved or failed. Video files saved to iCloud Drive → BadMonkey Inbox are picked up too.
+**From the phone:** links shared with the BadMonkey "Send to R&D" iPhone Shortcut wait in the workspace's phone inbox; VideoAnalyzer claims each link with its fencing token, heartbeats it every two minutes while queued or processing, and reports it as saved or failed with the same token. A `409` abandons the stale claim. Video files saved to iCloud Drive → BadMonkey Inbox are picked up too.
 
 ## Quick Start
 
@@ -166,14 +169,19 @@ Processed videos are stored in `~/.video-transcriber/outputs/<job_id>/`. Results
 | GET | `/api/queue` | Jobs waiting for download |
 | GET | `/api/thumbs/<job_id>/<file>` | Serve a thumbnail |
 | POST | `/api/analyze/<job_id>` | Re-run the local model on a saved transcript |
-| POST | `/api/export/<job_id>` | Send the lesson to BadMonkey Research |
+| POST | `/api/export/<job_id>` | Send the lesson to BadMonkey R&D |
 | GET | `/api/health` | Tools present, queue, disk, model and export settings (used by health agents) |
+
+The web API accepts only `Host: localhost:<port>` or `Host: 127.0.0.1:<port>`. Mutating browser requests must have a
+matching `Origin`. Local agents without an Origin must send `X-VideoAnalyzer-Token`, read from
+`~/.video-transcriber/token`; VideoAnalyzer creates that file with mode `0600` when it is missing.
 
 ## Project Structure
 
 ```
 ~/.video-transcriber/           # Runtime data
   ├── port                      # Current port
+  ├── token                     # Local agent API token (mode 0600)
   ├── uploads/                  # Temporary (deleted after processing)
   ├── config.json               # Optional settings (see above)
   └── outputs/<job_id>/         # Persisted results
@@ -185,7 +193,8 @@ Processed videos are stored in `~/.video-transcriber/outputs/<job_id>/`. Results
 
 ## Contributing
 
-PRs welcome. Keep it simple — `app.py` is the Flask app; `research.py` holds the optional links/analysis/export add-on.
+PRs welcome. Keep it simple — `app.py` is the Flask app; `research.py` holds the optional links/analysis/export add-on,
+and `research_egress.py` is the download-only loopback proxy.
 Tests: `uv run --with flask python -m unittest discover -s tests`.
 
 ## License

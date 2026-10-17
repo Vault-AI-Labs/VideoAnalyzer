@@ -1090,9 +1090,9 @@ function renderLesson(data, jobId) {
   const actions = el('div', 'lesson-actions');
   const again = el('button', 'btn', 'Re-analyse');
   again.onclick = async () => { again.disabled = true; again.textContent = 'Analysing...'; const res = await fetch('/api/analyze/' + jobId, { method: 'POST' }); const meta = await res.json(); again.disabled = false; again.textContent = 'Re-analyse'; if (res.ok) { currentData = Object.assign(meta, { job_id: jobId }); showResult(currentData, jobId); loadHistory(); } };
-  const send = el('button', 'btn btn-primary', 'Send to BadMonkey');
-  const state = el('span', 'export-state', data.export ? (data.export.ok ? 'Saved to BadMonkey Research ' + (data.export.at || '') : 'Not sent: ' + data.export.error) : '');
-  send.onclick = async () => { send.disabled = true; const res = await fetch('/api/export/' + jobId, { method: 'POST' }); const result = await res.json(); send.disabled = false; data.export = result; state.textContent = result.ok ? 'Saved to BadMonkey Research ' + (result.at || '') : 'Not sent: ' + result.error; };
+  const send = el('button', 'btn btn-primary', 'Send to BadMonkey R&D');
+  const state = el('span', 'export-state', data.export ? (data.export.ok ? 'Saved to BadMonkey R&D ' + (data.export.at || '') : 'Not sent: ' + data.export.error) : '');
+  send.onclick = async () => { send.disabled = true; const res = await fetch('/api/export/' + jobId, { method: 'POST' }); const result = await res.json(); send.disabled = false; data.export = result; state.textContent = result.ok ? 'Saved to BadMonkey R&D ' + (result.at || '') : 'Not sent: ' + result.error; };
   actions.append(again, send, state);
   box.append(actions);
 }

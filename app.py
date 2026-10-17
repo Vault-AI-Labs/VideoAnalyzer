@@ -4,8 +4,11 @@ import os
 import sys
 import uuid
 import json
+import hmac
+import secrets
 import signal
 import socket
+import stat
 import subprocess
 import threading
 import queue
@@ -13,7 +16,8 @@ import re
 import time
 from datetime import datetime
 from pathlib import Path
-from flask import Flask, request, jsonify, render_template, send_file, Response
+from urllib.parse import urlsplit
+from flask import Flask, abort, request, jsonify, render_template, send_file, Response
 
 app = Flask(__name__)
 
@@ -57,10 +61,81 @@ OUTPUTS = DATA_DIR / "outputs"
 UPLOADS.mkdir(parents=True, exist_ok=True)
 OUTPUTS.mkdir(parents=True, exist_ok=True)
 
+
+def _load_local_api_token(path):
+    """Create or read the agent token without ever following a token-file symlink."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    while True:
+        try:
+            descriptor = os.open(path, flags)
+            break
+        except FileNotFoundError:
+            token = secrets.token_urlsafe(32)
+            create_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+            try:
+                descriptor = os.open(path, create_flags, 0o600)
+            except FileExistsError:
+                continue
+            try:
+                os.write(descriptor, (token + "\n").encode())
+                os.fchmod(descriptor, 0o600)
+            finally:
+                os.close(descriptor)
+            continue
+
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise RuntimeError(f"Local API token is not a regular file: {path}")
+        os.fchmod(descriptor, 0o600)
+        token = os.read(descriptor, 4096).decode().strip()
+    finally:
+        os.close(descriptor)
+    if len(token) < 32:
+        raise RuntimeError(f"Local API token is invalid: {path}")
+    return token
+
+
+LOCAL_API_TOKEN = _load_local_api_token(DATA_DIR / "token")
+
 jobs: dict[str, queue.Queue] = {}
 
 NO_AUDIO_TRACK_MESSAGE = "[No audio track detected in this video.]"
 NO_SPEECH_DETECTED_MESSAGE = "[Audio was present but no speech was detected. The video may be music-only, too noisy, or in a language Whisper could not recognize.]"
+
+
+def _same_origin(origin):
+    try:
+        parsed = urlsplit(origin)
+    except ValueError:
+        return False
+    return (
+        parsed.scheme == request.scheme
+        and parsed.netloc.lower() == request.host.lower()
+        and parsed.path in ("", "/")
+        and not parsed.query
+        and not parsed.fragment
+        and parsed.username is None
+        and parsed.password is None
+    )
+
+
+@app.before_request
+def protect_local_api():
+    host = request.host.lower()
+    match = re.fullmatch(r"(?:127\.0\.0\.1|localhost):(\d{1,5})", host)
+    if not match or not 1 <= int(match.group(1)) <= 65535:
+        return jsonify({"error": "Invalid Host header"}), 400
+
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+        origin = request.headers.get("Origin", "")
+        if origin:
+            allowed = _same_origin(origin)
+        else:
+            supplied = request.headers.get("X-VideoAnalyzer-Token", "")
+            allowed = bool(supplied) and hmac.compare_digest(supplied, LOCAL_API_TOKEN)
+        if not allowed:
+            return jsonify({"error": "Local request authorization required"}), 403
 
 
 @app.route("/")
@@ -103,57 +178,117 @@ WHISPER_MODELS = ("tiny", "base", "small", "medium", "large", "turbo")
 url_queue: "queue.Queue[tuple]" = queue.Queue()
 waiting: list[str] = []
 waiting_lock = threading.Lock()
+INBOX_HEARTBEAT_SECONDS = 120
 
 
-def _enqueue_url(url, model, export=True, inbox_id=None, file=None):
+def _inbox_heartbeat(item_id, token, job_id, stop, lease_lost):
+    while not stop.wait(INBOX_HEARTBEAT_SECONDS):
+        try:
+            research.inbox_report(item_id, token, "processing", job=job_id)
+        except research.InboxLeaseLost:
+            lease_lost.set()
+            return
+
+
+def _enqueue_url(url, model, export=True, inbox_id=None, inbox_token=None, file=None):
     """Queue a link (or, with file=, a video file from the watched folder). One job runs at a time."""
+    if inbox_id and not inbox_token:
+        raise ValueError("An inbox fencing token is required")
     job_id = uuid.uuid4().hex[:8]
     jobs[job_id] = queue.Queue()
     with waiting_lock:
         waiting.append(job_id)
         position = len(waiting)
     jobs[job_id].put({"status": "queued", "message": f"Queued ({position} in line)..."})
-    url_queue.put((job_id, url, model, export, inbox_id, file))
+    lease = None
+    if inbox_id:
+        stop = threading.Event()
+        lease_lost = threading.Event()
+        heartbeat = threading.Thread(
+            target=_inbox_heartbeat,
+            args=(inbox_id, inbox_token, job_id, stop, lease_lost),
+            daemon=True,
+        )
+        heartbeat.start()
+        lease = (stop, lease_lost, heartbeat)
+    url_queue.put((job_id, url, model, export, inbox_id, inbox_token, lease, file))
     return job_id
 
 
 def _outcome(job_id):
     """(ok, module_id, error) for a finished job, read from what it saved."""
-    meta_file = OUTPUTS / job_id / "metadata.json"
+    meta_file = OUTPUTS / _safe_id(job_id) / "metadata.json"
     if not meta_file.exists():
         return False, "", "VideoAnalyzer could not process this video (see its window for the error)."
     export = json.loads(meta_file.read_text()).get("export") or {}
     if export.get("ok"):
         return True, export.get("module_id", ""), ""
-    return False, "", "Processed, but not saved to Research: " + export.get("error", "export is off")
+    return False, "", "Processed, but not saved to BadMonkey R&D: " + export.get("error", "export is off")
+
+
+def _raise_if_inbox_abandoned(cancel_event):
+    if cancel_event is not None and cancel_event.is_set():
+        raise research.InboxLeaseLost("Inbox lease lost; abandoning the local job")
+
+
+def _report_inbox_outcome(job_id, inbox_id, inbox_token, failure):
+    try:
+        ok, module_id, error = _outcome(job_id)
+        return research.inbox_report(
+            inbox_id,
+            inbox_token,
+            "done" if ok else "failed",
+            module_id=module_id,
+            error=failure or error,
+            job=job_id,
+        )
+    except research.InboxLeaseLost:
+        return False
+    except Exception as exception:
+        app.logger.warning(
+            "Inbox finalization failed for %s: %s: %s",
+            inbox_id,
+            type(exception).__name__,
+            exception,
+        )
+        return False
 
 
 def _url_worker():
     while True:
-        job_id, url, model, export, inbox_id, file = url_queue.get()
+        job_id, url, model, export, inbox_id, inbox_token, lease, file = url_queue.get()
         with waiting_lock:
             if job_id in waiting:
                 waiting.remove(job_id)
         q = jobs[job_id]
         failure = ""
+        lease_lost = lease[1] if lease else None
         try:
+            _raise_if_inbox_abandoned(lease_lost)
             if file:
                 video_path = UPLOADS / f"{job_id}{file.suffix.lower()}"
                 shutil.copy2(file, video_path)
                 research.file_done(file)
-                process_video(job_id, video_path, file.name, model, source={"platform": "upload", "title": file.stem[:200]}, export=export)
+                _raise_if_inbox_abandoned(lease_lost)
+                process_video(job_id, video_path, file.name, model, source={"platform": "upload", "title": file.stem[:200]}, export=export, cancel_event=lease_lost)
             else:
                 q.put({"status": "downloading", "message": "Downloading the video..."})
                 video_path, source = research.download(YTDLP, url, UPLOADS, job_id)
-                process_video(job_id, video_path, source.get("title") or url, model, source=source, export=export)
+                _raise_if_inbox_abandoned(lease_lost)
+                process_video(job_id, video_path, source.get("title") or url, model, source=source, export=export, cancel_event=lease_lost)
         except Exception as e:
             failure = str(e)[:500]
             q.put({"status": "error", "message": failure})
         finally:
-            if inbox_id:
-                ok, module_id, error = _outcome(job_id)
-                research.inbox_report(inbox_id, "done" if ok else "failed", module_id=module_id, error=failure or error, job=job_id)
-            url_queue.task_done()
+            try:
+                if lease:
+                    stop, lease_lost, heartbeat = lease
+                    stop.set()
+                    heartbeat.join()
+                if inbox_id and not lease_lost.is_set():
+                    _report_inbox_outcome(job_id, inbox_id, inbox_token, failure)
+            finally:
+                url_queue.task_done()
 
 
 # ---- phone inbox (links shared from the iPhone, held by the BadMonkey workspace) and the watched folder ----
@@ -166,15 +301,19 @@ def _phone_poller():
     while phone["enabled"]:
         try:
             if len(waiting) < 2:
-                item = research.inbox_next()
+                claim = research.inbox_next()
                 phone["last_poll"], phone["last_error"] = time.time(), ""
+                item = claim.get("item")
                 if item:
+                    token = claim.get("token")
+                    if not token:
+                        raise RuntimeError("Inbox claim did not include a fencing token")
                     try:
                         link = research.normalize_url(item["url"])
                     except ValueError as e:
-                        research.inbox_report(item["id"], "failed", error=str(e))
+                        research.inbox_report(item["id"], token, "failed", error=str(e))
                         continue
-                    _enqueue_url(link, research.PHONE_MODEL, True, inbox_id=item["id"])
+                    _enqueue_url(link, research.PHONE_MODEL, True, inbox_id=item["id"], inbox_token=token)
                     continue   # check for more right away
             else:
                 phone["last_poll"] = time.time()
@@ -328,7 +467,7 @@ def reanalyze(job_id):
 
 def _safe_id(job_id):
     if not re.fullmatch(r"[a-f0-9]{8}", job_id or ""):
-        return "invalid"
+        abort(404)
     return job_id
 
 
@@ -399,7 +538,7 @@ def _heuristic_title(transcript: str) -> str:
     return (s[0].upper() + s[1:]) if s else "Untitled"
 
 
-def _run_with_heartbeat(cmd, q, status_msg, timeout=600):
+def _run_with_heartbeat(cmd, q, status_msg, timeout=600, cancel_event=None):
     """Run a subprocess with periodic heartbeat messages, draining pipes properly."""
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     done = threading.Event()
@@ -410,17 +549,32 @@ def _run_with_heartbeat(cmd, q, status_msg, timeout=600):
 
     hb = threading.Thread(target=heartbeat, daemon=True)
     hb.start()
+    deadline = time.monotonic() + timeout
     try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
+        while True:
+            _raise_if_inbox_abandoned(cancel_event)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                proc.kill()
+                stdout, stderr = proc.communicate()
+                break
+            try:
+                stdout, stderr = proc.communicate(timeout=min(1, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                continue
+    except research.InboxLeaseLost:
         proc.kill()
-        stdout, stderr = proc.communicate()
+        proc.communicate()
+        raise
     finally:
         done.set()
     return proc.returncode, stdout, stderr
 
 
-def process_video(job_id, video_path, original_name, model, source=None, export=True):
+def process_video(job_id, video_path, original_name, model, source=None, export=True, cancel_event=None):
+    job_id = _safe_id(job_id)
+    _raise_if_inbox_abandoned(cancel_event)
     q = jobs[job_id]
     out_dir = OUTPUTS / job_id
     out_dir.mkdir(exist_ok=True)
@@ -435,6 +589,7 @@ def process_video(job_id, video_path, original_name, model, source=None, export=
              "-of", "csv=p=0", str(video_path)],
             capture_output=True, text=True,
         )
+        _raise_if_inbox_abandoned(cancel_event)
         duration = float(result.stdout.strip()) if result.stdout.strip() else 0
 
         # Extract audio to WAV first — handles all codecs reliably
@@ -445,6 +600,7 @@ def process_video(job_id, video_path, original_name, model, source=None, export=
              "-ar", "16000", "-ac", "1", str(wav_path), "-y"],
             capture_output=True, timeout=120,
         )
+        _raise_if_inbox_abandoned(cancel_event)
 
         transcript = ""
         transcript_text = NO_AUDIO_TRACK_MESSAGE
@@ -459,8 +615,9 @@ def process_video(job_id, video_path, original_name, model, source=None, export=
             rc, stdout, stderr = _run_with_heartbeat(
                 [WHISPER, str(wav_path), "--model", model, "--output_dir", str(out_dir),
                  "--output_format", "txt"],
-                q, f"Transcribing with whisper-{model}",
+                q, f"Transcribing with whisper-{model}", cancel_event=cancel_event,
             )
+            _raise_if_inbox_abandoned(cancel_event)
             if rc != 0:
                 raise RuntimeError(f"Whisper failed: {stderr[-500:].decode(errors='replace')}")
 
@@ -500,8 +657,9 @@ def process_video(job_id, video_path, original_name, model, source=None, export=
             [FFMPEG, "-i", str(video_path),
              "-vf", f"fps=1/{interval},scale=640:-2",
              "-q:v", "3", str(frames_dir / "frame_%03d.jpg"), "-y"],
-            q, "Extracting key frames",
+            q, "Extracting key frames", cancel_event=cancel_event,
         )
+        _raise_if_inbox_abandoned(cancel_event)
         if rc != 0:
             raise RuntimeError(f"FFmpeg failed: {stderr[-500:].decode(errors='replace')}")
 
@@ -514,6 +672,7 @@ def process_video(job_id, video_path, original_name, model, source=None, export=
         # A few spread-out thumbnails so the lesson is easy to recognise later
         q.put({"status": "frames", "message": "Capturing thumbnails..."})
         thumbs = research.thumbnails(FFMPEG, video_path, duration, out_dir / "thumbs", frame_files)
+        _raise_if_inbox_abandoned(cancel_event)
 
         # Remove uploaded video to save disk
         video_path.unlink(missing_ok=True)
@@ -523,6 +682,7 @@ def process_video(job_id, video_path, original_name, model, source=None, export=
         source.setdefault("key", research.source_key(source, job_id))
         q.put({"status": "analyzing_lesson", "message": f"Local model is reading the lesson ({research.LLM_MODEL})..."})
         analysis = research.analyze(transcript_text, source, [out_dir / "thumbs" / t for t in thumbs])
+        _raise_if_inbox_abandoned(cancel_event)
         summary = analysis.get("lesson_name") or _make_summary(transcript_text)
         frame_names = [f.name for f in frame_files]
         frame_paths = [str(frames_dir / f.name) for f in frame_files]
@@ -562,7 +722,8 @@ def process_video(job_id, video_path, original_name, model, source=None, export=
         (out_dir / "metadata.json").write_text(json.dumps(meta, indent=2))
 
         if export and research.export_configured() and research.AUTO_EXPORT:
-            q.put({"status": "exporting", "message": "Saving to BadMonkey Research..."})
+            _raise_if_inbox_abandoned(cancel_event)
+            q.put({"status": "exporting", "message": "Saving to BadMonkey R&D..."})
             meta["export"] = research.export(meta, out_dir)
             (out_dir / "metadata.json").write_text(json.dumps(meta, indent=2))
 
@@ -574,6 +735,8 @@ def process_video(job_id, video_path, original_name, model, source=None, export=
 
 @app.route("/api/stream/<job_id>")
 def stream(job_id):
+    job_id = _safe_id(job_id)
+
     def generate():
         q = jobs.get(job_id)
         if not q:
@@ -595,7 +758,7 @@ def stream(job_id):
 
 @app.route("/api/frames/<job_id>/<filename>")
 def serve_frame(job_id, filename):
-    path = OUTPUTS / job_id / "frames" / filename
+    path = OUTPUTS / _safe_id(job_id) / "frames" / filename
     if not path.exists():
         return "Not found", 404
     return send_file(path, mimetype="image/jpeg")
@@ -627,7 +790,7 @@ def history():
 @app.route("/api/status/<job_id>", methods=["PUT"])
 def update_status(job_id):
     import shutil
-    target = OUTPUTS / job_id
+    target = OUTPUTS / _safe_id(job_id)
     meta_file = target / "metadata.json"
 
     data = request.get_json()
@@ -636,8 +799,9 @@ def update_status(job_id):
         return jsonify({"error": "Invalid status"}), 400
 
     if new_status == "delete":
-        if target.exists():
-            shutil.rmtree(target)
+        if target.parent != OUTPUTS or target.is_symlink() or not target.is_dir():
+            return jsonify({"error": "Not found"}), 404
+        shutil.rmtree(target)
         return jsonify({"ok": True, "deleted": True})
 
     if not meta_file.exists():

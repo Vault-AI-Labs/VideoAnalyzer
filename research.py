@@ -11,7 +11,7 @@ Settings (environment or ~/.video-transcriber/config.json):
   VA_LLM_MODEL     default qwen3.8:27b
   VA_LLM_VISION    1 (default) sends the thumbnails as images too; falls back to text when the model refuses them
   VA_PRODUCTION_CONTEXT  path to a file describing your production flow (BadMonkey: research/PRODUCTION-CONTEXT.md)
-  VA_BADMONKEY_URL default http://127.0.0.1:4180      VA_BADMONKEY_KEY  = the workspace's BM_RESEARCH_KEY
+  VA_BADMONKEY_URL default http://127.0.0.1:4181      VA_BADMONKEY_KEY  = the workspace's BM_RESEARCH_KEY
   VA_AUTO_EXPORT   1 (default) exports every finished link/upload; 0 = only with the "Send to BadMonkey" button
   VA_YTDLP_COOKIES_BROWSER  e.g. safari or chrome, for videos TikTok only shows when signed in
 """
@@ -19,18 +19,30 @@ import base64
 import hashlib
 import ipaddress
 import json
+import logging
 import os
 import re
+import shutil
 import subprocess
 import time
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
+
+import research_egress
+
+
+logger = logging.getLogger(__name__)
+
+
+class InboxLeaseLost(RuntimeError):
+    """The workspace no longer recognizes this item's fencing token."""
 
 LLM_URL = os.environ.get("VA_LLM_URL", "http://127.0.0.1:11434/v1").rstrip("/")
 LLM_MODEL = os.environ.get("VA_LLM_MODEL", "qwen3.8:27b")
 LLM_VISION = os.environ.get("VA_LLM_VISION", "1") == "1"
-BADMONKEY_URL = os.environ.get("VA_BADMONKEY_URL", "http://127.0.0.1:4180").rstrip("/")
+BADMONKEY_URL = os.environ.get("VA_BADMONKEY_URL", "http://127.0.0.1:4181").rstrip("/")
 BADMONKEY_KEY = os.environ.get("VA_BADMONKEY_KEY", "")
 AUTO_EXPORT = os.environ.get("VA_AUTO_EXPORT", "1") == "1"
 COOKIES_BROWSER = os.environ.get("VA_YTDLP_COOKIES_BROWSER", "")
@@ -114,15 +126,24 @@ def links_from_tiktok_export(data, include=("favorite",)):
 # ---- download ------------------------------------------------------------------------------------
 def download(ytdlp, url, uploads, job_id, run=subprocess.run):
     template = str(Path(uploads) / f"{job_id}.%(ext)s")
-    cmd = [ytdlp, "--no-playlist", "--no-progress", "--no-warnings", "-f", "mp4/bestvideo*+bestaudio/best",
-           "--merge-output-format", "mp4", "--max-filesize", "500M", "--write-info-json", "-o", template,
-           "--print", "after_move:filepath", url]
-    if COOKIES_BROWSER:
-        cmd[1:1] = ["--cookies-from-browser", COOKIES_BROWSER]
-    try:
-        result = run(cmd, capture_output=True, text=True, timeout=600)
-    except FileNotFoundError:
-        raise RuntimeError("yt-dlp is not installed on the Studio. Run: brew install yt-dlp")
+    with research_egress.loopback_proxy() as proxy_url:
+        cmd = [ytdlp, "--proxy", proxy_url, "--no-playlist", "--no-progress", "--no-warnings", "-f", "mp4/bestvideo*+bestaudio/best",
+               "--merge-output-format", "mp4", "--max-filesize", "300M", "--write-info-json", "-o", template,
+               "--print", "after_move:filepath", url]
+        if COOKIES_BROWSER:
+            cmd[1:1] = ["--cookies-from-browser", COOKIES_BROWSER]
+        sandbox = shutil.which("sandbox-exec")
+        if sandbox:
+            port = proxy_url.rsplit(":", 1)[1]
+            profile = ("(version 1) (allow default) (deny network-outbound) "
+                       f'(allow network-outbound (remote ip "localhost:{port}"))')
+            cmd = [sandbox, "-p", profile] + cmd
+        else:
+            logger.warning("sandbox-exec is unavailable; running yt-dlp without the macOS sandbox wrapper")
+        try:
+            result = run(cmd, capture_output=True, text=True, timeout=600)
+        except FileNotFoundError:
+            raise RuntimeError("yt-dlp is not installed on the Studio. Run: brew install yt-dlp")
     if result.returncode != 0:
         tail = (result.stderr or "").strip().splitlines()[-1:] or ["unknown error"]
         hint = " TikTok may need you signed in: set VA_YTDLP_COOKIES_BROWSER=safari (or chrome)." if "login" in tail[0].lower() or "private" in tail[0].lower() else ""
@@ -364,7 +385,7 @@ def payload(meta, out_dir):
 
 def export(meta, out_dir, opener=urlopen):
     if not export_configured():
-        return {"ok": False, "error": "Set VA_BADMONKEY_KEY (the workspace's BM_RESEARCH_KEY) to send lessons to BadMonkey."}
+        return {"ok": False, "error": "Set VA_BADMONKEY_KEY (the workspace's BM_RESEARCH_KEY) to send lessons to BadMonkey R&D."}
     request = Request(BADMONKEY_URL + "/api/v1/research/machine/ingest", data=json.dumps(payload(meta, out_dir)).encode(), method="POST",
                       headers={"Content-Type": "application/json", "X-BM-Research-Key": BADMONKEY_KEY})
     try:
@@ -390,15 +411,22 @@ def _machine(path, body, opener=urlopen):
 
 
 def inbox_next(opener=urlopen):
-    """The oldest link shared from the phone, claimed for this VideoAnalyzer (or None)."""
-    return _machine("inbox/next", {}, opener).get("item")
+    """Claim the oldest phone link and return its item plus fencing token."""
+    return _machine("inbox/next", {}, opener)
 
 
-def inbox_report(item_id, status, module_id="", error="", job="", opener=urlopen):
+def inbox_report(item_id, token, status, module_id="", error="", job="", opener=urlopen):
     try:
-        _machine("inbox/" + item_id, {"status": status, "module_id": module_id or "", "error": (error or "")[:500], "job": job}, opener)
-    except Exception:
-        pass   # the workspace's health check flags links left processing
+        _machine("inbox/" + item_id, {"token": token, "status": status, "module_id": module_id or "", "error": (error or "")[:500], "job": job}, opener)
+        return True
+    except HTTPError as exception:
+        if exception.code == 409:
+            logger.warning("Inbox report rejected with HTTP 409 for %s; abandoning the item", item_id)
+            raise InboxLeaseLost(item_id) from exception
+        logger.warning("Inbox report failed for %s: HTTPError %s", item_id, exception.code)
+    except Exception as exception:
+        logger.warning("Inbox report failed for %s: %s: %s", item_id, type(exception).__name__, exception)
+    return False
 
 
 def watch_dir():
