@@ -538,6 +538,11 @@ def _heuristic_title(transcript: str) -> str:
     return (s[0].upper() + s[1:]) if s else "Untitled"
 
 
+def transcribe_timeout(duration):
+    """Seconds Whisper may run: three times the audio length, never less than 10 minutes."""
+    return max(600, int((duration or 0) * 3))
+
+
 def _run_with_heartbeat(cmd, q, status_msg, timeout=600, cancel_event=None):
     """Run a subprocess with periodic heartbeat messages, draining pipes properly."""
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -615,9 +620,12 @@ def process_video(job_id, video_path, original_name, model, source=None, export=
             rc, stdout, stderr = _run_with_heartbeat(
                 [WHISPER, str(wav_path), "--model", model, "--output_dir", str(out_dir),
                  "--output_format", "txt"],
-                q, f"Transcribing with whisper-{model}", cancel_event=cancel_event,
+                q, f"Transcribing with whisper-{model}", timeout=transcribe_timeout(duration), cancel_event=cancel_event,
             )
             _raise_if_inbox_abandoned(cancel_event)
+            if rc is not None and rc < 0:
+                minutes = transcribe_timeout(duration) // 60
+                raise RuntimeError(f"Transcription stopped after {minutes} minutes for a {duration / 60:.0f}-minute video.")
             if rc != 0:
                 raise RuntimeError(f"Whisper failed: {stderr[-500:].decode(errors='replace')}")
 

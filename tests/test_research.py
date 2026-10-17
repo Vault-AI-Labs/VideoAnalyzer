@@ -581,3 +581,22 @@ class Pipeline(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TranscribeTimeout(unittest.TestCase):
+    def test_long_videos_get_time_in_proportion(self):
+        self.assertEqual(app.transcribe_timeout(0), 600)
+        self.assertEqual(app.transcribe_timeout(60), 600)
+        self.assertEqual(app.transcribe_timeout(1129), 3387)   # the 19-minute TikTok that hit the old 10-minute cap
+
+    def test_a_timed_out_transcription_says_so(self):
+        with mock.patch.object(app, "_run_with_heartbeat", return_value=(-9, b"", b"")) as run:
+            app.jobs["abcdef12"] = __import__("queue").Queue()
+            source = Path(TEMP.name) / "clip.mp4"
+            subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "sine=duration=2", "-f", "lavfi", "-i", "color=size=64x64:duration=2", "-shortest", str(source)], check=True)
+            app.process_video("abcdef12", source, "clip.mp4", "base", export=False)
+            messages = []
+            while not app.jobs["abcdef12"].empty():
+                messages.append(app.jobs["abcdef12"].get()["message"])
+            self.assertTrue(any("Transcription stopped after 10 minutes" in m for m in messages), messages)
+            self.assertEqual(run.call_args.kwargs["timeout"], 600)
