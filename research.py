@@ -42,6 +42,8 @@ class InboxLeaseLost(RuntimeError):
 LLM_URL = os.environ.get("VA_LLM_URL", "http://127.0.0.1:11434/v1").rstrip("/")
 LLM_MODEL = os.environ.get("VA_LLM_MODEL", "qwen3.8:27b")
 LLM_VISION = os.environ.get("VA_LLM_VISION", "1") == "1"
+# Thinking models (qwen3.8) spent the whole reply budget thinking and returned no JSON; off by default.
+LLM_THINK = os.environ.get("VA_LLM_THINK", "0") == "1"
 BADMONKEY_URL = os.environ.get("VA_BADMONKEY_URL", "http://127.0.0.1:4181").rstrip("/")
 BADMONKEY_KEY = os.environ.get("VA_BADMONKEY_KEY", "")
 AUTO_EXPORT = os.environ.get("VA_AUTO_EXPORT", "1") == "1"
@@ -247,7 +249,9 @@ def _local(url):
 def _chat(messages, opener=urlopen, timeout=600):
     if not _local(LLM_URL):
         raise RuntimeError("VA_LLM_URL must be a local address; lessons never go to a hosted model")
-    body = {"model": LLM_MODEL, "messages": messages, "temperature": 0.2, "max_tokens": 2500, "stream": False, "response_format": {"type": "json_object"}}
+    body = {"model": LLM_MODEL, "messages": messages, "temperature": 0.2, "max_tokens": 4000, "stream": False, "response_format": {"type": "json_object"}}
+    if not LLM_THINK:
+        body["reasoning_effort"] = "none"
     request = Request(LLM_URL + "/chat/completions", data=json.dumps(body).encode(), method="POST",
                       headers={"Content-Type": "application/json", "Authorization": "Bearer local"})
     with opener(request, timeout=timeout) as response:

@@ -600,3 +600,14 @@ class TranscribeTimeout(unittest.TestCase):
                 messages.append(app.jobs["abcdef12"].get()["message"])
             self.assertTrue(any("Transcription stopped after 10 minutes" in m for m in messages), messages)
             self.assertEqual(run.call_args.kwargs["timeout"], 600)
+
+
+class ThinkingOff(unittest.TestCase):
+    def test_analysis_asks_the_model_not_to_think(self):
+        seen = {}
+        def opener(request, timeout=None):
+            seen.update(json.loads(request.data))
+            return Reply({"choices": [{"message": {"content": "{}"}}]})
+        research._chat([{"role": "user", "content": "x"}], opener=opener)
+        self.assertEqual(seen.get("reasoning_effort"), "none")
+        self.assertEqual(seen.get("max_tokens"), 4000)
