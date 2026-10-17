@@ -9,6 +9,8 @@ import socket
 import subprocess
 import threading
 import queue
+import re
+import time
 from datetime import datetime
 from pathlib import Path
 from flask import Flask, request, jsonify, render_template, send_file, Response
@@ -35,8 +37,21 @@ os.environ["PATH"] = _SEARCH_PATHS
 FFPROBE = shutil.which("ffprobe", path=_SEARCH_PATHS) or "ffprobe"
 FFMPEG = shutil.which("ffmpeg", path=_SEARCH_PATHS) or "ffmpeg"
 WHISPER = shutil.which("whisper", path=_SEARCH_PATHS) or "whisper"
+YTDLP = shutil.which("yt-dlp", path=_SEARCH_PATHS) or "yt-dlp"
 
-DATA_DIR = Path.home() / ".video-transcriber"
+DATA_DIR = Path(os.environ.get("VA_DATA_DIR", Path.home() / ".video-transcriber"))
+
+# Finder-launched apps get no shell environment: ~/.video-transcriber/config.json fills the gaps.
+_CONFIG_FILE = DATA_DIR / "config.json"
+if _CONFIG_FILE.is_file():
+    try:
+        for _key, _value in json.loads(_CONFIG_FILE.read_text()).items():
+            if isinstance(_value, (str, int, float)):
+                os.environ.setdefault(_key, str(_value))
+    except (OSError, ValueError):
+        pass
+
+import research  # noqa: E402  (needs the settings above)
 UPLOADS = DATA_DIR / "uploads"
 OUTPUTS = DATA_DIR / "outputs"
 UPLOADS.mkdir(parents=True, exist_ok=True)
@@ -60,23 +75,191 @@ def upload():
 
     f = request.files["file"]
     model = request.form.get("model", "base")
+    if model not in WHISPER_MODELS:
+        return jsonify({"error": "Unknown Whisper model"}), 400
+    export = request.form.get("export", "1") != "0"
     job_id = uuid.uuid4().hex[:8]
 
-    ext = Path(f.filename).suffix
+    ext = re.sub(r"[^A-Za-z0-9.]", "", Path(f.filename or "video.mp4").suffix)[:8] or ".mp4"
     video_path = UPLOADS / f"{job_id}{ext}"
     f.save(video_path)
 
     jobs[job_id] = queue.Queue()
 
     t = threading.Thread(
-        target=process_video, args=(job_id, video_path, f.filename, model), daemon=True
+        target=process_video, args=(job_id, video_path, f.filename, model),
+        kwargs={"source": {"platform": "upload"}, "export": export}, daemon=True
     )
     t.start()
 
     return jsonify({"job_id": job_id, "filename": f.filename})
 
 
-import re
+WHISPER_MODELS = ("tiny", "base", "small", "medium", "large", "turbo")
+
+
+# ---- TikTok (and other saved-video) links ---------------------------------------------------------
+# One video at a time: Whisper and the local model are heavy, and TikTok throttles bursts.
+url_queue: "queue.Queue[tuple]" = queue.Queue()
+waiting: list[str] = []
+waiting_lock = threading.Lock()
+
+
+def _enqueue_url(url, model, export=True):
+    job_id = uuid.uuid4().hex[:8]
+    jobs[job_id] = queue.Queue()
+    with waiting_lock:
+        waiting.append(job_id)
+        position = len(waiting)
+    jobs[job_id].put({"status": "queued", "message": f"Queued ({position} in line)..."})
+    url_queue.put((job_id, url, model, export))
+    return job_id
+
+
+def _url_worker():
+    while True:
+        job_id, url, model, export = url_queue.get()
+        with waiting_lock:
+            if job_id in waiting:
+                waiting.remove(job_id)
+        q = jobs[job_id]
+        try:
+            q.put({"status": "downloading", "message": "Downloading the video..."})
+            video_path, source = research.download(YTDLP, url, UPLOADS, job_id)
+            process_video(job_id, video_path, source.get("title") or url, model, source=source, export=export)
+        except Exception as e:
+            q.put({"status": "error", "message": str(e)[:500]})
+        finally:
+            url_queue.task_done()
+
+
+def _queue_ticker():
+    # Keeps waiting browsers connected (the stream gives up after 120 s of silence).
+    while True:
+        time.sleep(30)
+        with waiting_lock:
+            snapshot = list(waiting)
+        for i, job_id in enumerate(snapshot, 1):
+            if job_id in jobs:
+                jobs[job_id].put({"status": "queued", "message": f"Queued ({i} in line)..."})
+
+
+threading.Thread(target=_url_worker, daemon=True).start()
+threading.Thread(target=_queue_ticker, daemon=True).start()
+
+
+def _known_sources():
+    known = set()
+    for meta_file in OUTPUTS.glob("*/metadata.json"):
+        try:
+            key = json.loads(meta_file.read_text()).get("source", {}).get("key")
+        except (OSError, ValueError):
+            continue
+        if key:
+            known.add(key)
+    return known
+
+
+@app.route("/api/ingest-url", methods=["POST"])
+def ingest_url():
+    """Paste one or more TikTok links (one per line). Each is downloaded and processed in turn."""
+    data = request.get_json(silent=True) or {}
+    model = data.get("model", "base")
+    if model not in WHISPER_MODELS:
+        return jsonify({"error": "Unknown Whisper model"}), 400
+    raw = data.get("urls") if isinstance(data.get("urls"), list) else str(data.get("url", "")).split()
+    links, rejected = [], []
+    for item in raw[:200]:
+        try:
+            links.append(research.normalize_url(str(item)))
+        except ValueError as e:
+            rejected.append({"url": str(item)[:200], "error": str(e)})
+    known = _known_sources()
+    queued, skipped = [], []
+    for link in dict.fromkeys(links):
+        key = research.source_key_for_url(link)
+        if key and key in known and not data.get("force"):
+            skipped.append(link)
+            continue
+        queued.append({"url": link, "job_id": _enqueue_url(link, model, data.get("export", True) is not False)})
+    if not queued and not skipped:
+        return jsonify({"error": "No supported video links found.", "rejected": rejected}), 400
+    return jsonify({"queued": queued, "skipped": skipped, "rejected": rejected})
+
+
+@app.route("/api/import-tiktok", methods=["POST"])
+def import_tiktok():
+    """Upload TikTok's 'Download your data' JSON; every Favorite (saved) video is queued. Likes with include=likes."""
+    f = request.files.get("file")
+    if not f:
+        return jsonify({"error": "Choose the user_data JSON file from your TikTok data download."}), 400
+    try:
+        export = json.loads(f.read(60_000_000))
+    except ValueError:
+        return jsonify({"error": "That file is not JSON. In TikTok, request your data in JSON format."}), 400
+    include = ("favorite", "like") if request.form.get("include") == "likes" else ("favorite",)
+    links = research.links_from_tiktok_export(export, include)
+    if not links:
+        return jsonify({"error": "No saved (Favorite) videos were found in that file."}), 400
+    limit = max(1, min(int(request.form.get("limit", "50") or 50), 500))
+    known = _known_sources()
+    fresh = [u for u in links if research.source_key_for_url(u) not in known]
+    queued = [{"url": u, "job_id": _enqueue_url(u, request.form.get("model", "base") if request.form.get("model") in WHISPER_MODELS else "base")} for u in fresh[:limit]]
+    return jsonify({"found": len(links), "already_saved": len(links) - len(fresh), "queued": queued, "left_for_later": max(0, len(fresh) - limit)})
+
+
+@app.route("/api/queue")
+def queue_status():
+    with waiting_lock:
+        return jsonify({"waiting": list(waiting)})
+
+
+@app.route("/api/health")
+def health():
+    tools = {name: bool(shutil.which(path) or Path(path).is_file()) for name, path in (("ffmpeg", FFMPEG), ("ffprobe", FFPROBE), ("whisper", WHISPER), ("yt-dlp", YTDLP))}
+    free = shutil.disk_usage(DATA_DIR).free
+    return jsonify({
+        "ok": all(tools.values()) and free > 2e9,
+        "tools": tools,
+        "queue": len(waiting),
+        "disk_free_gb": round(free / 1e9, 1),
+        "analysis_model": research.LLM_MODEL,
+        "analysis_url": research.LLM_URL,
+        "badmonkey_export": research.export_configured(),
+    })
+
+
+@app.route("/api/export/<job_id>", methods=["POST"])
+def export_job(job_id):
+    meta_file = OUTPUTS / _safe_id(job_id) / "metadata.json"
+    if not meta_file.exists():
+        return jsonify({"error": "Not found"}), 404
+    meta = json.loads(meta_file.read_text())
+    meta["export"] = research.export(meta, meta_file.parent)
+    meta_file.write_text(json.dumps(meta, indent=2))
+    status = 200 if meta["export"].get("ok") else 502
+    return jsonify(meta["export"]), status
+
+
+@app.route("/api/analyze/<job_id>", methods=["POST"])
+def reanalyze(job_id):
+    """Run the local model again on a saved transcript (e.g. after starting Ollama)."""
+    out_dir = OUTPUTS / _safe_id(job_id)
+    meta_file = out_dir / "metadata.json"
+    if not meta_file.exists():
+        return jsonify({"error": "Not found"}), 404
+    meta = json.loads(meta_file.read_text())
+    meta["analysis"] = research.analyze(meta.get("transcript", ""), meta.get("source", {}), [out_dir / "thumbs" / t for t in meta.get("thumbnails", [])])
+    if meta["analysis"].get("lesson_name"):
+        meta["summary"] = meta["analysis"]["lesson_name"]
+    meta_file.write_text(json.dumps(meta, indent=2))
+    return jsonify(meta)
+
+
+def _safe_id(job_id):
+    if not re.fullmatch(r"[a-f0-9]{8}", job_id or ""):
+        return "invalid"
+    return job_id
 
 
 import urllib.request
@@ -167,7 +350,7 @@ def _run_with_heartbeat(cmd, q, status_msg, timeout=600):
     return proc.returncode, stdout, stderr
 
 
-def process_video(job_id, video_path, original_name, model):
+def process_video(job_id, video_path, original_name, model, source=None, export=True):
     q = jobs[job_id]
     out_dir = OUTPUTS / job_id
     out_dir.mkdir(exist_ok=True)
@@ -258,11 +441,19 @@ def process_video(job_id, video_path, original_name, model):
             f.unlink()
         frame_files = frame_files[:24]
 
+        # A few spread-out thumbnails so the lesson is easy to recognise later
+        q.put({"status": "frames", "message": "Capturing thumbnails..."})
+        thumbs = research.thumbnails(FFMPEG, video_path, duration, out_dir / "thumbs", frame_files)
+
         # Remove uploaded video to save disk
         video_path.unlink(missing_ok=True)
 
         duration_fmt = f"{int(duration // 60)}:{int(duration % 60):02d}"
-        summary = _make_summary(transcript_text)
+        source = dict(source or {})
+        source.setdefault("key", research.source_key(source, job_id))
+        q.put({"status": "analyzing_lesson", "message": f"Local model is reading the lesson ({research.LLM_MODEL})..."})
+        analysis = research.analyze(transcript_text, source, [out_dir / "thumbs" / t for t in thumbs])
+        summary = analysis.get("lesson_name") or _make_summary(transcript_text)
         frame_names = [f.name for f in frame_files]
         frame_paths = [str(frames_dir / f.name) for f in frame_files]
 
@@ -294,8 +485,16 @@ def process_video(job_id, video_path, original_name, model):
             "item_status": "new",
             "status_date": now,
             "created_at": now,
+            "source": source,
+            "thumbnails": thumbs,
+            "analysis": analysis,
         }
         (out_dir / "metadata.json").write_text(json.dumps(meta, indent=2))
+
+        if export and research.export_configured() and research.AUTO_EXPORT:
+            q.put({"status": "exporting", "message": "Saving to BadMonkey Research..."})
+            meta["export"] = research.export(meta, out_dir)
+            (out_dir / "metadata.json").write_text(json.dumps(meta, indent=2))
 
         q.put({"status": "complete", "message": "Done!", "data": meta})
 
@@ -327,6 +526,16 @@ def stream(job_id):
 @app.route("/api/frames/<job_id>/<filename>")
 def serve_frame(job_id, filename):
     path = OUTPUTS / job_id / "frames" / filename
+    if not path.exists():
+        return "Not found", 404
+    return send_file(path, mimetype="image/jpeg")
+
+
+@app.route("/api/thumbs/<job_id>/<filename>")
+def serve_thumb(job_id, filename):
+    if not re.fullmatch(r"thumb_\d\.jpg", filename):
+        return "Not found", 404
+    path = OUTPUTS / _safe_id(job_id) / "thumbs" / filename
     if not path.exists():
         return "Not found", 404
     return send_file(path, mimetype="image/jpeg")

@@ -1,3 +1,2 @@
 __pycache__/
-*.iconset/
-.duo/
+*.pyc
