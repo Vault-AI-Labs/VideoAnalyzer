@@ -32,7 +32,7 @@ This turns passive video consumption into active creation. Every tutorial, every
 
 ## Features
 
-- **100% Local** — Whisper runs on your machine. Nothing leaves your computer.
+- **100% Local** — Whisper runs on your machine (on the Apple GPU via whisper.cpp when installed). Nothing leaves your computer.
 - **Thumbnails** — Visual previews in the history list so you can find videos at a glance
 - **Status Tracking** — Mark videos as New, Doing It, Skipped, or Revisit Later
 - **LLM-Generated Titles** — Smart headlines via local Ollama (e.g., "Build an AI Agent in 5 Minutes")
@@ -54,7 +54,10 @@ VideoAnalyzer can also take **links** instead of files and turn each video into 
 - **Lesson analysis by a local model** (OpenAI-compatible endpoint: Ollama, vllm-mlx, LM Studio — never a hosted API):
   lesson name, summary, key points, tools, category, and a recommendation (adopt / trial / watch / skip, value 0–10,
   where it fits your production flow, effort, steps). Thumbnails are sent as images when the model supports vision.
-  Describe your production flow in a file and point `VA_PRODUCTION_CONTEXT` at it.
+  Describe your production flow in a file and point `VA_PRODUCTION_CONTEXT` at it. A **roundup** video (several tools
+  or releases) becomes one lesson that covers every item: its name lists them, and the summary, key points and tools
+  include each one. Misheard names (speech-to-text writes "mu spark" for Muse Spark) are corrected only when the
+  caption, hashtags or pictures show the right spelling.
 - **Send to BadMonkey R&D**: exports the lesson to the BadMonkey workspace's R&D module (automatic when configured).
 
 Settings go in the environment or `~/.video-transcriber/config.json` (Finder launches have no shell environment):
@@ -69,7 +72,8 @@ Settings go in the environment or `~/.video-transcriber/config.json` (Finder lau
 | `VA_DATA_DIR` | `~/.video-transcriber` |
 | `VA_WATCH_DIR` | iCloud Drive → `BadMonkey Inbox` (video files dropped there are processed, then moved to `Done`); `off` disables |
 | `VA_INBOX_POLL` | `20` seconds between checks of the BadMonkey phone inbox (links shared from the iPhone) |
-| `VA_PHONE_WHISPER_MODEL` | `base` (Whisper model for phone links and watched files) |
+| `VA_PHONE_WHISPER_MODEL` | `small` when the whisper.cpp small model is installed, else `base` (phone links and watched files) |
+| `VA_WHISPER_CPP_MODELS` | `~/.cache/whisper-cpp` (where `ggml-<model>.bin` files for whisper.cpp live) |
 
 If the model is down the video is still saved; press **Re-analyse** later.
 
@@ -84,6 +88,18 @@ Install via Homebrew:
 ```bash
 brew install openai-whisper ffmpeg
 ```
+
+Recommended (transcription on the Apple GPU, about ten times faster than the CPU Whisper on a busy Mac):
+
+```bash
+brew install whisper-cpp
+mkdir -p ~/.cache/whisper-cpp
+curl -L -o ~/.cache/whisper-cpp/ggml-small.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin
+```
+
+A model is used by whisper.cpp only when its `ggml-<model>.bin` file is present; any other model falls back to the
+CPU Whisper. Measured on a loaded Mac Studio, 2 minutes of speech: whisper.cpp small 12 s, CPU Whisper base 22 s,
+CPU Whisper small over 10 minutes.
 
 Optional (for smart title generation):
 
@@ -113,7 +129,7 @@ Double-click `VideoAnalyzer.app` or `VideoTranscriber.app` on your Desktop if yo
 1. **Upload** — Drop any video file (MP4, MOV, WebM, MKV, AVI)
 2. **Analyze** — ffprobe extracts video duration
 3. **Extract Audio** — ffmpeg converts audio to 16kHz mono WAV (handles all codecs reliably)
-4. **Transcribe** — Whisper processes the extracted audio locally (model selectable)
+4. **Transcribe** — Whisper processes the extracted audio locally (model selectable): whisper.cpp on the Apple GPU when its model file is installed, otherwise the CPU Whisper
 5. **Extract Frames** — ffmpeg pulls key frames at smart intervals:
    - Under 60s: every 3 seconds
    - 60-180s: every 10 seconds
@@ -147,7 +163,7 @@ Processed videos are stored in `~/.video-transcriber/outputs/<job_id>/`. Results
 |-----------|-----------|
 | Backend | Python Flask (single file `app.py`) |
 | Frontend | Vanilla HTML/JS (`templates/index.html`), no build step |
-| Transcription | OpenAI Whisper (local) |
+| Transcription | whisper.cpp on the Apple GPU when its model is installed; OpenAI Whisper (CPU) otherwise |
 | Frame extraction | ffmpeg |
 | Title generation | Ollama gemma3:4b (optional, heuristic fallback) |
 | Link downloads | yt-dlp (optional) |
