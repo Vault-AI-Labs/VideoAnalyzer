@@ -338,13 +338,18 @@ def normalize(raw):
 def analyze(transcript, source, thumb_paths=(), opener=urlopen):
     """Never raises: a down model leaves {"ok": False, "error": ...} and the lesson is still saved."""
     started = time.time()
-    lines = [f"# Our production flow\n{production_context()}", "", "# The video"]
+    image_reference = source.get("kind") == "image"
+    heading = "# The reference image" if image_reference else "# The video"
+    lines = [f"# Our production flow\n{production_context()}", "", heading]
     for label, key in (("Platform", "platform"), ("Creator", "author"), ("Caption", "title"), ("Description", "description")):
         if source.get(key):
             lines.append(f"{label}: {source[key]}")
     if source.get("tags"):
         lines.append("Hashtags: " + ", ".join(source["tags"]))
-    lines += ["", "## Transcript", (transcript or "")[:24000]]
+    if image_reference:
+        lines += ["", "Format: Image reference. There is no transcript — analyse what the attached picture itself shows."]
+    else:
+        lines += ["", "## Transcript", (transcript or "")[:24000]]
     text = "\n".join(lines)
     images = []
     if LLM_VISION:
@@ -355,7 +360,10 @@ def analyze(transcript, source, thumb_paths=(), opener=urlopen):
                 pass
     attempts = []
     if images:
-        attempts.append([{"type": "text", "text": text + "\n\nThe attached pictures are frames from the video (on-screen text and UI often carry the lesson)."}]
+        pictures_note = ("The attached picture IS the reference image; describe and judge what it shows."
+                         if image_reference else
+                         "The attached pictures are frames from the video (on-screen text and UI often carry the lesson).")
+        attempts.append([{"type": "text", "text": text + "\n\n" + pictures_note}]
                         + [{"type": "image_url", "image_url": {"url": u}} for u in images])
     attempts.append(text)
     error = ""
@@ -433,8 +441,25 @@ def _machine(path, body, opener=urlopen):
 
 
 def inbox_next(opener=urlopen):
-    """Claim the oldest phone link and return its item plus fencing token."""
+    """Claim the oldest phone link or dropped file and return its item plus fencing token."""
     return _machine("inbox/next", {}, opener)
+
+
+def upload_media(item_id, opener=urlopen):
+    """Fetch a dropped file's bytes from the workspace (loopback, machine key). Raises on any HTTP error."""
+    request = Request(BADMONKEY_URL + f"/api/v1/research/machine/uploads/{item_id}/media", method="GET",
+                      headers={"X-BM-Research-Key": BADMONKEY_KEY})
+    with opener(request, timeout=60) as response:
+        return response.read()
+
+
+UPLOAD_KINDS = {".png": "image", ".jpg": "image", ".jpeg": "image", ".webp": "image",
+                ".mp3": "audio", ".wav": "audio", ".m4a": "audio",
+                ".mp4": "video", ".m4v": "video", ".mov": "video"}
+
+
+def upload_kind(name):
+    return UPLOAD_KINDS.get(Path(str(name)).suffix.lower(), "video")
 
 
 def inbox_report(item_id, token, status, module_id="", error="", job="", opener=urlopen):

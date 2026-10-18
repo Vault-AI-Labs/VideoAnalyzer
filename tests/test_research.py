@@ -4,6 +4,7 @@ Run: uv run --with flask python -m unittest discover -s tests
 The pipeline test uses the real ffmpeg (when installed) and a stand-in Whisper; no model or network is used.
 """
 import base64
+import hashlib
 import io
 import json
 import os
@@ -464,6 +465,7 @@ class Phone(unittest.TestCase):
                 "lease-token",
                 lease,
                 None,
+                None,
             ))
             app.url_queue.join()
 
@@ -633,3 +635,99 @@ class ThinkingOff(unittest.TestCase):
             return Reply({"choices": [{"message": {"content": json.dumps(GOOD)}}]})
         research.analyze("Three releases today: mu spark, Neymotron 3.5 and bonds.", {"title": "Muse Spark, Nemotron 3.5, Bonsai"}, opener=opener)
         self.assertIn("covers ALL of them", sent[0]["messages"][0]["content"])
+
+
+class DroppedMedia(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "needs ffmpeg")
+    def test_dropped_image_becomes_a_vision_lesson(self):
+        folder = Path(TEMP.name) / "drop-image"
+        folder.mkdir(exist_ok=True)
+        picture = folder / "reference.png"
+        subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=480x320", "-frames:v", "1", str(picture), "-y"], check=True)
+        blob = picture.read_bytes()
+        trap = folder / "whisper-trap"
+        trap.write_text('#!/bin/sh\necho "whisper must not run for an image" >&2\nexit 1\n')
+        trap.chmod(0o755)
+        prompts = []
+
+        def chat(messages, opener=None, timeout=None):
+            prompts.append(messages[1]["content"])
+            return json.dumps(GOOD)
+
+        def export(meta, out_dir, opener=None):
+            return {"ok": True, "module_id": "c" * 40}
+
+        source = {"platform": "upload", "title": "studio reference", "key": "upload:" + hashlib.sha256(blob).hexdigest(), "kind": "image"}
+        with mock.patch.object(app, "WHISPER", str(trap)), mock.patch.object(research, "_chat", chat), mock.patch.object(research, "export", export):
+            job = app._enqueue_url("", "tiny", True, file=picture, source=source)
+            events = []
+            deadline = time.time() + 120
+            while time.time() < deadline:
+                event = app.jobs[job].get(timeout=120)
+                events.append(event["status"])
+                if event["status"] in ("complete", "error"):
+                    break
+        self.assertEqual(events[-1], "complete", events)
+        meta = json.loads((app.OUTPUTS / job / "metadata.json").read_text())
+        self.assertEqual(meta["original_name"], "studio reference")
+        self.assertEqual(meta["transcript"], "")
+        self.assertEqual(len(meta["thumbnails"]), 1)
+        self.assertTrue(base64.b64decode(research.payload(meta, app.OUTPUTS / job)["thumbnails"][0]).startswith(b"\xff\xd8"))
+        self.assertEqual(research.payload(meta, app.OUTPUTS / job)["source_key"], source["key"])
+        self.assertIn("reference image", str(prompts[0]))
+        self.assertNotIn("## Transcript", str(prompts[0]))
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "needs ffmpeg")
+    def test_dropped_audio_transcribes_without_frames(self):
+        folder = Path(TEMP.name) / "drop-audio"
+        folder.mkdir(exist_ok=True)
+        whisper = folder / "whisper"
+        whisper.write_text('#!/bin/sh\nwhile [ "$1" != "--output_dir" ]; do shift; done\necho "A voice memo about motion curves." > "$2/audio.txt"\n')
+        whisper.chmod(0o755)
+        clip = folder / "memo.wav"
+        subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "sine=frequency=440", "-t", "3", str(clip), "-y"], check=True)
+
+        def chat(messages, opener=None, timeout=None):
+            return json.dumps(GOOD)
+
+        def export(meta, out_dir, opener=None):
+            return {"ok": True, "module_id": "d" * 40}
+
+        source = {"platform": "upload", "title": "motion memo", "key": "upload:" + hashlib.sha256(clip.read_bytes()).hexdigest(), "kind": "audio"}
+        with mock.patch.object(app, "WHISPER", str(whisper)), mock.patch.object(research, "_chat", chat), mock.patch.object(research, "export", export):
+            job = app._enqueue_url("", "tiny", True, file=clip, source=source)
+            events = []
+            deadline = time.time() + 120
+            while time.time() < deadline:
+                event = app.jobs[job].get(timeout=120)
+                events.append(event["status"])
+                if event["status"] in ("complete", "error"):
+                    break
+        self.assertEqual(events[-1], "complete", events)
+        meta = json.loads((app.OUTPUTS / job / "metadata.json").read_text())
+        self.assertEqual(meta["original_name"], "motion memo")
+        self.assertIn("motion curves", meta["transcript"])
+        self.assertEqual(meta["thumbnails"], [])
+        self.assertEqual(meta["frames"], [])
+
+    def test_upload_media_client_fetches_bytes_with_the_machine_key(self):
+        seen = {}
+
+        class Reply:
+            def __init__(self, data):self._data = data
+            def read(self):return self._data
+            def __enter__(self):return self
+            def __exit__(self, *args):return False
+
+        def opener(request, timeout=None):
+            seen["url"] = request.full_url
+            seen["key"] = request.get_header("X-bm-research-key")
+            return Reply(b"bytes-here")
+
+        with mock.patch.object(research, "BADMONKEY_URL", "http://127.0.0.1:4181"), mock.patch.object(research, "BADMONKEY_KEY", "k" * 40):
+            self.assertEqual(research.upload_media("a" * 40, opener), b"bytes-here")
+        self.assertEqual(seen["url"], "http://127.0.0.1:4181/api/v1/research/machine/uploads/" + "a" * 40 + "/media")
+        self.assertEqual(seen["key"], "k" * 40)
+        self.assertEqual(research.upload_kind("Clip.MOV"), "video")
+        self.assertEqual(research.upload_kind("note.m4a"), "audio")
+        self.assertEqual(research.upload_kind("poster.PNG"), "image")

@@ -5,6 +5,7 @@ import sys
 import uuid
 import json
 import hmac
+import hashlib
 import secrets
 import signal
 import socket
@@ -190,8 +191,9 @@ def _inbox_heartbeat(item_id, token, job_id, stop, lease_lost):
             return
 
 
-def _enqueue_url(url, model, export=True, inbox_id=None, inbox_token=None, file=None):
-    """Queue a link (or, with file=, a video file from the watched folder). One job runs at a time."""
+def _enqueue_url(url, model, export=True, inbox_id=None, inbox_token=None, file=None, source=None):
+    """Queue a link (or, with file=, a media file: watched folder or a dropped R&D upload, whose display
+    name, content-hash source key and kind ride in source=). One job runs at a time."""
     if inbox_id and not inbox_token:
         raise ValueError("An inbox fencing token is required")
     job_id = uuid.uuid4().hex[:8]
@@ -211,7 +213,7 @@ def _enqueue_url(url, model, export=True, inbox_id=None, inbox_token=None, file=
         )
         heartbeat.start()
         lease = (stop, lease_lost, heartbeat)
-    url_queue.put((job_id, url, model, export, inbox_id, inbox_token, lease, file))
+    url_queue.put((job_id, url, model, export, inbox_id, inbox_token, lease, file, source))
     return job_id
 
 
@@ -256,7 +258,7 @@ def _report_inbox_outcome(job_id, inbox_id, inbox_token, failure):
 
 def _url_worker():
     while True:
-        job_id, url, model, export, inbox_id, inbox_token, lease, file = url_queue.get()
+        job_id, url, model, export, inbox_id, inbox_token, lease, file, file_source = url_queue.get()
         with waiting_lock:
             if job_id in waiting:
                 waiting.remove(job_id)
@@ -268,9 +270,14 @@ def _url_worker():
             if file:
                 video_path = UPLOADS / f"{job_id}{file.suffix.lower()}"
                 shutil.copy2(file, video_path)
-                research.file_done(file)
+                if file_source is None:   # watched-folder file: keep it yours, moved to Done
+                    research.file_done(file)
+                else:                     # R&D upload temp file: ours to remove
+                    file.unlink(missing_ok=True)
                 _raise_if_inbox_abandoned(lease_lost)
-                process_video(job_id, video_path, file.name, model, source={"platform": "upload", "title": file.stem[:200]}, export=export, cancel_event=lease_lost)
+                source = file_source or {"platform": "upload", "title": file.stem[:200]}
+                display_name = source.get("title") or file.stem[:200]
+                process_video(job_id, video_path, display_name, model, source=source, export=export, cancel_event=lease_lost)
             else:
                 q.put({"status": "downloading", "message": "Downloading the video..."})
                 video_path, source = research.download(YTDLP, url, UPLOADS, job_id)
@@ -308,6 +315,20 @@ def _phone_poller():
                     token = claim.get("token")
                     if not token:
                         raise RuntimeError("Inbox claim did not include a fencing token")
+                    if str(item.get("url", "")).startswith("upload:"):
+                        try:   # a file dropped on the R&D page: fetch its bytes, then the normal file pipeline
+                            blob = research.upload_media(item["id"])
+                            name = str(item.get("name") or "file")
+                            suffix = Path(name).suffix.lower() or ".bin"
+                            tmp = UPLOADS / f"drop-{item['id'][:12]}{suffix}"
+                            tmp.write_bytes(blob)
+                            _enqueue_url("", research.PHONE_MODEL, True, inbox_id=item["id"], inbox_token=token, file=tmp,
+                                         source={"platform": "upload", "title": name[:200],
+                                                 "key": "upload:" + hashlib.sha256(blob).hexdigest(),
+                                                 "kind": research.upload_kind(name)})
+                        except Exception as e:
+                            research.inbox_report(item["id"], token, "failed", error=f"could not fetch the dropped file: {e}"[:500])
+                        continue   # check for more right away
                     try:
                         link = research.normalize_url(item["url"])
                     except ValueError as e:
@@ -587,104 +608,135 @@ def process_video(job_id, video_path, original_name, model, source=None, export=
     frames_dir.mkdir(exist_ok=True)
 
     try:
-        # Analyze
-        q.put({"status": "analyzing", "message": "Analyzing video..."})
-        result = subprocess.run(
-            [FFPROBE, "-v", "error", "-show_entries", "format=duration",
-             "-of", "csv=p=0", str(video_path)],
-            capture_output=True, text=True,
-        )
-        _raise_if_inbox_abandoned(cancel_event)
-        duration = float(result.stdout.strip()) if result.stdout.strip() else 0
-
-        # Extract audio to WAV first — handles all codecs reliably
-        q.put({"status": "transcribing", "message": "Extracting audio..."})
-        wav_path = out_dir / "audio.wav"
-        audio_result = subprocess.run(
-            [FFMPEG, "-i", str(video_path), "-vn", "-acodec", "pcm_s16le",
-             "-ar", "16000", "-ac", "1", str(wav_path), "-y"],
-            capture_output=True, timeout=120,
-        )
-        _raise_if_inbox_abandoned(cancel_event)
-
-        transcript = ""
-        transcript_text = NO_AUDIO_TRACK_MESSAGE
-        has_audio_track = (
-            audio_result.returncode == 0
-            and wav_path.exists()
-            and wav_path.stat().st_size > 1000
-        )
-        if has_audio_track:
-            # Transcribe the extracted audio
-            q.put({"status": "transcribing", "message": f"Transcribing with whisper-{model}..."})
-            fast = research.fast_whisper(model)
-            command = ([fast[0], "-m", str(fast[1]), "-f", str(wav_path), "-l", "auto", "-otxt", "-of", str(out_dir / "audio"), "-np"]
-                       if fast else [WHISPER, str(wav_path), "--model", model, "--output_dir", str(out_dir), "--output_format", "txt"])
-            rc, stdout, stderr = _run_with_heartbeat(
-                command,
-                q, f"Transcribing with whisper-{model}", timeout=transcribe_timeout(duration), cancel_event=cancel_event,
+        kind = (source or {}).get("kind") or "video"
+        if kind == "image":   # the picture IS the reference: no probing, no audio, no frames
+            duration = 0.0
+            transcript = ""
+            transcript_text = ""
+        else:
+            # Analyze
+            q.put({"status": "analyzing", "message": "Analyzing media..."})
+            result = subprocess.run(
+                [FFPROBE, "-v", "error", "-show_entries", "format=duration",
+                 "-of", "csv=p=0", str(video_path)],
+                capture_output=True, text=True,
             )
             _raise_if_inbox_abandoned(cancel_event)
-            if rc is not None and rc < 0:
-                minutes = transcribe_timeout(duration) // 60
-                raise RuntimeError(f"Transcription stopped after {minutes} minutes for a {duration / 60:.0f}-minute video.")
-            if rc != 0:
-                raise RuntimeError(f"Whisper failed: {stderr[-500:].decode(errors='replace')}")
+            duration = float(result.stdout.strip()) if result.stdout.strip() else 0
 
-            transcript_file = out_dir / "audio.txt"
-            if not transcript_file.exists():
-                whisper_output = (stderr + stdout)[-1000:].decode(errors="replace").strip()
-                raise RuntimeError(
-                    "Whisper did not create a transcript file."
-                    + (f" Output: {whisper_output}" if whisper_output else "")
+            # Extract audio to WAV first — handles all codecs reliably
+            q.put({"status": "transcribing", "message": "Extracting audio..."})
+            wav_path = out_dir / "audio.wav"
+            audio_result = subprocess.run(
+                [FFMPEG, "-i", str(video_path), "-vn", "-acodec", "pcm_s16le",
+                 "-ar", "16000", "-ac", "1", str(wav_path), "-y"],
+                capture_output=True, timeout=120,
+            )
+            _raise_if_inbox_abandoned(cancel_event)
+
+            transcript = ""
+            transcript_text = NO_AUDIO_TRACK_MESSAGE
+            has_audio_track = (
+                audio_result.returncode == 0
+                and wav_path.exists()
+                and wav_path.stat().st_size > 1000
+            )
+            if has_audio_track:
+                # Transcribe the extracted audio
+                q.put({"status": "transcribing", "message": f"Transcribing with whisper-{model}..."})
+                fast = research.fast_whisper(model)
+                command = ([fast[0], "-m", str(fast[1]), "-f", str(wav_path), "-l", "auto", "-otxt", "-of", str(out_dir / "audio"), "-np"]
+                           if fast else [WHISPER, str(wav_path), "--model", model, "--output_dir", str(out_dir), "--output_format", "txt"])
+                rc, stdout, stderr = _run_with_heartbeat(
+                    command,
+                    q, f"Transcribing with whisper-{model}", timeout=transcribe_timeout(duration), cancel_event=cancel_event,
                 )
-            transcript = transcript_file.read_text().strip()
-            if transcript_file.exists():
-                transcript_file.unlink()
+                _raise_if_inbox_abandoned(cancel_event)
+                if rc is not None and rc < 0:
+                    minutes = transcribe_timeout(duration) // 60
+                    raise RuntimeError(f"Transcription stopped after {minutes} minutes for a {duration / 60:.0f}-minute video.")
+                if rc != 0:
+                    raise RuntimeError(f"Whisper failed: {stderr[-500:].decode(errors='replace')}")
 
-            if transcript:
-                transcript_text = transcript
-            else:
-                transcript_text = NO_SPEECH_DETECTED_MESSAGE
+                transcript_file = out_dir / "audio.txt"
+                if not transcript_file.exists():
+                    whisper_output = (stderr + stdout)[-1000:].decode(errors="replace").strip()
+                    raise RuntimeError(
+                        "Whisper did not create a transcript file."
+                        + (f" Output: {whisper_output}" if whisper_output else "")
+                    )
+                transcript = transcript_file.read_text().strip()
+                if transcript_file.exists():
+                    transcript_file.unlink()
 
-        wav_path.unlink(missing_ok=True)
+                if transcript:
+                    transcript_text = transcript
+                else:
+                    transcript_text = NO_SPEECH_DETECTED_MESSAGE
+
+            wav_path.unlink(missing_ok=True)
 
         # Save clean transcript
         (out_dir / "transcript.txt").write_text(transcript_text)
 
-        # Extract frames
-        q.put({"status": "frames", "message": "Extracting key frames..."})
-
-        total_secs = max(int(duration), 1)
-        if total_secs < 60:
-            interval = 3
-        elif total_secs < 180:
-            interval = 10
+        frame_files = []
+        thumbs = []
+        if kind == "image":
+            # One JPEG thumbnail of the picture itself, sized for the lesson ingest
+            q.put({"status": "frames", "message": "Preparing the image..."})
+            thumbs_dir = out_dir / "thumbs"
+            thumbs_dir.mkdir(exist_ok=True)
+            target = thumbs_dir / "thumb_1.jpg"
+            rc, _, stderr = _run_with_heartbeat(
+                [FFMPEG, "-i", str(video_path), "-vf", "scale='min(1440,iw)':-2", "-q:v", "5", str(target), "-y"],
+                q, "Preparing the image", cancel_event=cancel_event,
+            )
+            _raise_if_inbox_abandoned(cancel_event)
+            if rc != 0 or not target.is_file() or target.stat().st_size >= 400_000:
+                rc, _, stderr = _run_with_heartbeat(
+                    [FFMPEG, "-i", str(video_path), "-vf", "scale=720:-2", "-q:v", "8", str(target), "-y"],
+                    q, "Preparing the image", cancel_event=cancel_event,
+                )
+                _raise_if_inbox_abandoned(cancel_event)
+            if rc != 0 or not target.is_file() or not 0 < target.stat().st_size < 400_000:
+                raise RuntimeError(f"Could not turn the image into a storable thumbnail: {stderr[-300:].decode(errors='replace') if rc else 'too large'}")
+            thumbs = [target.name]
+        elif kind == "audio":
+            q.put({"status": "frames", "message": "Audio-only file — no frames to capture..."})
         else:
-            interval = 20
+            # Extract frames
+            q.put({"status": "frames", "message": "Extracting key frames..."})
 
-        rc, stdout, stderr = _run_with_heartbeat(
-            [FFMPEG, "-i", str(video_path),
-             "-vf", f"fps=1/{interval},scale=640:-2",
-             "-q:v", "3", str(frames_dir / "frame_%03d.jpg"), "-y"],
-            q, "Extracting key frames", cancel_event=cancel_event,
-        )
-        _raise_if_inbox_abandoned(cancel_event)
-        if rc != 0:
-            raise RuntimeError(f"FFmpeg failed: {stderr[-500:].decode(errors='replace')}")
+            total_secs = max(int(duration), 1)
+            if total_secs < 60:
+                interval = 3
+            elif total_secs < 180:
+                interval = 10
+            else:
+                interval = 20
 
-        # Cap at 24 frames
-        frame_files = sorted(frames_dir.glob("*.jpg"))
-        for f in frame_files[24:]:
-            f.unlink()
-        frame_files = frame_files[:24]
+            rc, stdout, stderr = _run_with_heartbeat(
+                [FFMPEG, "-i", str(video_path),
+                 "-vf", f"fps=1/{interval},scale=640:-2",
+                 "-q:v", "3", str(frames_dir / "frame_%03d.jpg"), "-y"],
+                q, "Extracting key frames", cancel_event=cancel_event,
+            )
+            _raise_if_inbox_abandoned(cancel_event)
+            if rc != 0:
+                raise RuntimeError(f"FFmpeg failed: {stderr[-500:].decode(errors='replace')}")
 
-        # A few spread-out thumbnails so the lesson is easy to recognise later
-        q.put({"status": "frames", "message": "Capturing thumbnails..."})
-        thumbs = research.thumbnails(FFMPEG, video_path, duration, out_dir / "thumbs", frame_files)
-        _raise_if_inbox_abandoned(cancel_event)
+            # Cap at 24 frames
+            frame_files = sorted(frames_dir.glob("*.jpg"))
+            for f in frame_files[24:]:
+                f.unlink()
+            frame_files = frame_files[:24]
 
-        # Remove uploaded video to save disk
+            # A few spread-out thumbnails so the lesson is easy to recognise later
+            q.put({"status": "frames", "message": "Capturing thumbnails..."})
+            thumbs = research.thumbnails(FFMPEG, video_path, duration, out_dir / "thumbs", frame_files)
+            _raise_if_inbox_abandoned(cancel_event)
+
+        # Remove the uploaded input to save disk
         video_path.unlink(missing_ok=True)
 
         duration_fmt = f"{int(duration // 60)}:{int(duration % 60):02d}"
