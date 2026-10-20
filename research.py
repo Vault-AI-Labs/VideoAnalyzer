@@ -73,6 +73,8 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".mkv"}
 CATEGORIES = ("AI agents", "Video & motion", "Design", "Dev tooling", "Marketing", "Sales", "Operations", "Other")
 VERDICTS = ("adopt", "trial", "watch", "skip")
 TIKTOK_ID = re.compile(r"/(?:video|v|share/video)/(\d{8,25})")
+TIKTOK_PHOTO = re.compile(r"/photo/(\d{8,25})")   # slideshow posts: yt-dlp refuses this address ("Unsupported URL")
+PHOTO_NOTE = "TikTok slideshow: only the first slide and the caption can be downloaded."
 
 
 # ---- links ---------------------------------------------------------------------------------------
@@ -88,6 +90,9 @@ def normalize_url(raw):
         match = TIKTOK_ID.search(parts.path)
         if match:   # canonical form; tracking query strings dropped
             return f"https://www.tiktok.com/@_/video/{match.group(1)}"
+        photo = TIKTOK_PHOTO.search(parts.path)
+        if photo:
+            return f"https://www.tiktok.com/@_/photo/{photo.group(1)}"
         return f"https://{host}{parts.path}"   # short vm./vt. links: yt-dlp follows the redirect
     return url
 
@@ -98,7 +103,7 @@ def platform_for(url):
 
 
 def source_key_for_url(url):
-    match = TIKTOK_ID.search(urlsplit(url).path)
+    match = TIKTOK_ID.search(urlsplit(url).path) or TIKTOK_PHOTO.search(urlsplit(url).path)
     if match:
         return f"tiktok:{match.group(1)}"
     return None   # short links are only known after download
@@ -138,12 +143,10 @@ def links_from_tiktok_export(data, include=("favorite",)):
 
 
 # ---- download ------------------------------------------------------------------------------------
-def download(ytdlp, url, uploads, job_id, run=subprocess.run):
-    template = str(Path(uploads) / f"{job_id}.%(ext)s")
+def _ytdlp(ytdlp, args, run):
+    """yt-dlp through the loopback egress proxy, inside the macOS sandbox when it is available."""
     with research_egress.loopback_proxy() as proxy_url:
-        cmd = [ytdlp, "--proxy", proxy_url, "--no-playlist", "--no-progress", "--no-warnings", "-f", "mp4/bestvideo*+bestaudio/best",
-               "--merge-output-format", "mp4", "--max-filesize", "300M", "--write-info-json", "-o", template,
-               "--print", "after_move:filepath", url]
+        cmd = [ytdlp, "--proxy", proxy_url, *args]
         if COOKIES_BROWSER:
             cmd[1:1] = ["--cookies-from-browser", COOKIES_BROWSER]
         sandbox = shutil.which("sandbox-exec")
@@ -155,11 +158,83 @@ def download(ytdlp, url, uploads, job_id, run=subprocess.run):
         else:
             logger.warning("sandbox-exec is unavailable; running yt-dlp without the macOS sandbox wrapper")
         try:
-            result = run(cmd, capture_output=True, text=True, timeout=600)
+            return run(cmd, capture_output=True, text=True, timeout=600)
         except FileNotFoundError:
             raise RuntimeError("yt-dlp is not installed on the Studio. Run: brew install yt-dlp")
+
+
+def _read_info(uploads, job_id):
+    info_file = Path(uploads) / f"{job_id}.info.json"
+    info = {}
+    if info_file.is_file():
+        try:
+            info = json.loads(info_file.read_text())
+        except ValueError:
+            pass
+        info_file.unlink(missing_ok=True)
+    return info
+
+
+def _author(info):
+    """The creator's @handle. TikTok's uploader_id is a number ("@6998278543810544646" on the R&D cards); its uploader is the handle."""
+    handle = str(info.get("uploader") or "")
+    if handle and re.fullmatch(r"@?[A-Za-z0-9._]{2,30}", handle) and not handle.lstrip("@").isdigit():
+        return "@" + handle.lstrip("@")
+    uid = str(info.get("uploader_id") or "")
+    return ("@" + uid if uid and not uid.startswith("@") else uid) or handle
+
+
+def _source_from_info(info, url):
+    page = info.get("webpage_url") or url
+    source = {
+        "platform": platform_for(page),
+        "url": page if page.startswith("https://") else url,
+        "id": str(info.get("id") or ""),
+        "author": _author(info),
+        "title": (info.get("title") or info.get("description") or "")[:200],
+        "description": (info.get("description") or "")[:2000],
+        "tags": [t for t in (info.get("tags") or []) if isinstance(t, str)][:20],
+    }
+    if not source["id"]:
+        source["id"] = (source_key_for_url(url) or "").split(":")[-1]
+    return source
+
+
+def download_photo(ytdlp, photo_id, uploads, job_id, run=subprocess.run):
+    """A TikTok slideshow. yt-dlp refuses the /photo/ address but reads the same post as /video/: that gives the caption
+    and the cover (the first slide). The other slides need TikTok's signed private API, so the lesson is made from the
+    first slide and the caption, as a picture, and says so. The background music is not downloaded (measured 2026-10-20)."""
+    template = str(Path(uploads) / f"{job_id}.%(ext)s")
+    result = _ytdlp(ytdlp, ["--no-playlist", "--no-progress", "--no-warnings", "--skip-download", "--write-info-json",
+                            "--write-thumbnail", "--convert-thumbnails", "jpg", "-o", template,
+                            f"https://www.tiktok.com/@_/video/{photo_id}"], run)
     if result.returncode != 0:
         tail = (result.stderr or "").strip().splitlines()[-1:] or ["unknown error"]
+        raise RuntimeError("Download failed (TikTok slideshow): " + tail[0][:300])
+    # yt-dlp keeps a cover that is already JPEG as ".jpeg" (seen on the real post 2026-10-20) and converts others to ".jpg"
+    picture = next((p for p in (Path(uploads) / f"{job_id}.{ext}" for ext in ("jpg", "jpeg", "png", "webp")) if p.is_file()), None)
+    if not picture:
+        raise RuntimeError("TikTok slideshow: the first slide could not be downloaded.")
+    url = f"https://www.tiktok.com/@_/photo/{photo_id}"
+    source = _source_from_info(_read_info(uploads, job_id), url)
+    source.update(kind="image", id=source["id"] or photo_id, url=url,
+                  description=(PHOTO_NOTE + "\n" + source["description"]).strip()[:2000])
+    return picture, source
+
+
+def download(ytdlp, url, uploads, job_id, run=subprocess.run):
+    photo = TIKTOK_PHOTO.search(urlsplit(url).path) if "tiktok" in (urlsplit(url).hostname or "") else None
+    if photo:
+        return download_photo(ytdlp, photo.group(1), uploads, job_id, run)
+    template = str(Path(uploads) / f"{job_id}.%(ext)s")
+    result = _ytdlp(ytdlp, ["--no-playlist", "--no-progress", "--no-warnings", "-f", "mp4/bestvideo*+bestaudio/best",
+                            "--merge-output-format", "mp4", "--max-filesize", "300M", "--write-info-json", "-o", template,
+                            "--print", "after_move:filepath", url], run)
+    if result.returncode != 0:
+        tail = (result.stderr or "").strip().splitlines()[-1:] or ["unknown error"]
+        moved = TIKTOK_PHOTO.search(tail[0]) if "Unsupported URL" in tail[0] and "tiktok.com" in tail[0] else None
+        if moved:   # a short link that turned out to be a slideshow: one more request, for the slideshow
+            return download_photo(ytdlp, moved.group(1), uploads, job_id, run)
         hint = " TikTok may need you signed in: set VA_YTDLP_COOKIES_BROWSER=safari (or chrome)." if "login" in tail[0].lower() or "private" in tail[0].lower() else ""
         raise RuntimeError("Download failed: " + tail[0][:300] + hint)
     lines = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
@@ -169,27 +244,7 @@ def download(ytdlp, url, uploads, job_id, run=subprocess.run):
         if not candidates:
             raise RuntimeError("Download finished but no video file was saved.")
         video = candidates[0]
-    info_file = Path(uploads) / f"{job_id}.info.json"
-    info = {}
-    if info_file.is_file():
-        try:
-            info = json.loads(info_file.read_text())
-        except ValueError:
-            pass
-        info_file.unlink(missing_ok=True)
-    page = info.get("webpage_url") or url
-    source = {
-        "platform": platform_for(page),
-        "url": page if page.startswith("https://") else url,
-        "id": str(info.get("id") or ""),
-        "author": "@" + info["uploader_id"] if info.get("uploader_id") and not str(info["uploader_id"]).startswith("@") else (info.get("uploader_id") or info.get("uploader") or ""),
-        "title": (info.get("title") or info.get("description") or "")[:200],
-        "description": (info.get("description") or "")[:2000],
-        "tags": [t for t in (info.get("tags") or []) if isinstance(t, str)][:20],
-    }
-    if not source["id"]:
-        source["id"] = (source_key_for_url(url) or "").split(":")[-1]
-    return video, source
+    return video, _source_from_info(_read_info(uploads, job_id), url)
 
 
 # ---- thumbnails ----------------------------------------------------------------------------------

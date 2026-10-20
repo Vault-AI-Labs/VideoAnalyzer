@@ -147,6 +147,70 @@ class DownloadSecurity(unittest.TestCase):
         self.assertIn("sandbox-exec is unavailable", "\n".join(logs.output))
 
 
+class TikTokSlideshows(unittest.TestCase):
+    """2026-10-20: two phone links failed with 'Unsupported URL: .../photo/<id>' (TikTok slideshows)."""
+    PHOTO_ID = "7698719022048726285"
+
+    def _photo_run(self, folder, commands, short_link_fails=False, ext="jpg"):
+        def run(command, **kwargs):
+            commands.append(command)
+            if short_link_fails and len(commands) == 1:
+                return subprocess.CompletedProcess(command, 1, "", f"ERROR: Unsupported URL: https://www.tiktok.com/@martn.ai/photo/{self.PHOTO_ID}?_r=1&_t=ZP")
+            (Path(folder) / f"deadbeef.{ext}").write_bytes(b"jpeg")
+            (Path(folder) / "deadbeef.info.json").write_text(json.dumps({"id": self.PHOTO_ID, "uploader": "martn.ai", "uploader_id": "6998278543810544646", "title": "Connect prompts.chat to Claude Code", "description": "Connect prompts.chat to Claude Code through MCP."}))
+            return subprocess.CompletedProcess(command, 0, "", "")
+        return run
+
+    def test_author_is_the_handle_not_the_number(self):
+        self.assertEqual(research._author({"uploader": "martn.ai", "uploader_id": "6998278543810544646"}), "@martn.ai")
+        self.assertEqual(research._author({"uploader": "Some Channel Name", "uploader_id": "@somechannel"}), "@somechannel")   # YouTube: display name has spaces
+        self.assertEqual(research._author({"uploader_id": "maker"}), "@maker")
+
+    def test_photo_link_is_kept_and_identified(self):
+        url = research.normalize_url(f"https://www.tiktok.com/@martn.ai/photo/{self.PHOTO_ID}?_r=1&_t=x")
+        self.assertEqual(url, f"https://www.tiktok.com/@_/photo/{self.PHOTO_ID}")
+        self.assertEqual(research.source_key_for_url(url), f"tiktok:{self.PHOTO_ID}")
+
+    def test_photo_post_becomes_a_picture_lesson_from_one_request(self):
+        with tempfile.TemporaryDirectory() as folder:
+            commands = []
+            picture, source = research.download("yt-dlp", f"https://www.tiktok.com/@_/photo/{self.PHOTO_ID}", folder, "deadbeef", run=self._photo_run(folder, commands))
+            self.assertEqual(picture.name, "deadbeef.jpg")
+        self.assertEqual(len(commands), 1)
+        command = commands[0]
+        self.assertIn(f"https://www.tiktok.com/@_/video/{self.PHOTO_ID}", command)
+        self.assertIn("--skip-download", command)          # no background music
+        self.assertIn("--write-thumbnail", command)
+        self.assertRegex(command[command.index("--proxy") + 1], r"^http://127\.0\.0\.1:\d+$")   # same confined network path
+        self.assertEqual(source["kind"], "image")
+        self.assertEqual(source["author"], "@martn.ai")
+        self.assertTrue(source["description"].startswith(research.PHOTO_NOTE))
+        self.assertEqual(source["url"], f"https://www.tiktok.com/@_/photo/{self.PHOTO_ID}")
+
+    def test_a_cover_saved_as_jpeg_is_found(self):
+        with tempfile.TemporaryDirectory() as folder:
+            picture, source = research.download("yt-dlp", f"https://www.tiktok.com/@_/photo/{self.PHOTO_ID}", folder, "deadbeef", run=self._photo_run(folder, [], ext="jpeg"))
+            self.assertEqual(picture.name, "deadbeef.jpeg")
+
+    def test_short_link_that_is_a_slideshow_takes_one_more_request(self):
+        with tempfile.TemporaryDirectory() as folder:
+            commands = []
+            picture, source = research.download("yt-dlp", "https://www.tiktok.com/t/ZPLAFSmrC", folder, "deadbeef", run=self._photo_run(folder, commands, short_link_fails=True))
+        self.assertEqual(len(commands), 2)
+        self.assertIn(f"https://www.tiktok.com/@_/video/{self.PHOTO_ID}", commands[1])
+        self.assertEqual(source["kind"], "image")
+
+    def test_other_failures_still_fail_after_one_request(self):
+        commands = []
+        def run(command, **kwargs):
+            commands.append(command)
+            return subprocess.CompletedProcess(command, 1, "", "ERROR: Unsupported URL: https://example.com/x")
+        with tempfile.TemporaryDirectory() as folder:
+            with self.assertRaisesRegex(RuntimeError, "Download failed: ERROR: Unsupported URL"):
+                research.download("yt-dlp", "https://www.tiktok.com/t/ZPLAFSmrC", folder, "deadbeef", run=run)
+        self.assertEqual(len(commands), 1)
+
+
 class Analysis(unittest.TestCase):
     def test_parses_reasoning_output_and_clamps_fields(self):
         answer = "<think>long reasoning {not json}</think>\n```json\n" + json.dumps(GOOD) + "\n```"
