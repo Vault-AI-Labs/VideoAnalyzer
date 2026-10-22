@@ -70,7 +70,7 @@ def fast_whisper(model):
 PHONE_MODEL = os.environ.get("VA_PHONE_WHISPER_MODEL") or ("small" if fast_whisper("small") else "base")
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".mkv"}
 
-CATEGORIES = ("AI agents", "Video & motion", "Design", "Dev tooling", "Marketing", "Sales", "Operations", "Other")
+CATEGORIES = ("Funding", "Design", "AI Ops", "Models", "Video", "Voice", "Memory", "Skills", "Harness", "Marketing", "Hardware", "AI Architecture", "Workflows", "CRM", "Sales", "Dev tooling", "Operations", "Other")   # keep in lockstep with the website's portal_research.CATEGORIES
 VERDICTS = ("adopt", "trial", "watch", "skip")
 TIKTOK_ID = re.compile(r"/(?:video|v|share/video)/(\d{8,25})")
 TIKTOK_PHOTO = re.compile(r"/photo/(\d{8,25})")   # slideshow posts: yt-dlp refuses this address ("Unsupported URL")
