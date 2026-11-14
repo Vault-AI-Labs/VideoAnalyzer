@@ -9,6 +9,7 @@ import io
 import json
 import os
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -221,6 +222,57 @@ class Analysis(unittest.TestCase):
         self.assertEqual(result["recommendation"]["value_score"], 8)
         self.assertEqual(result["recommendation"]["effort"], "M")
         self.assertEqual(result["key_points"], ["a", "b"])
+
+    def test_multi_topic_videos_keep_twelve_key_points_and_link_rules(self):
+        points = [f"point {n}" for n in range(1, 13)] + ["Cal.com — booking pages: https://cal.com"]
+        self.assertEqual(research._keep_links(points, 12), points[:11] + points[12:])   # the link survives the cap
+        for rule in ("at least one sentence per topic", "up to 12", "not only the main one", "on screen", "misheard", "NOT confirmed",
+                     "show the\nsame spelling", "Never guess", "its own key point at the end", "https://cal.com"):
+            self.assertIn(rule, research.SYSTEM)
+        self.assertNotIn("3-6 sentences", research.SYSTEM)
+
+    def test_links_are_checked_in_code_not_trusted_from_the_model(self):
+        source = {"title": "Book calls with Cal.com", "description": "", "tags": ["n8n"]}
+        transcript = "go to 11labs.io for the voice. join the ai profit board at aiprofiborm.com. cal.com books it."
+        points = ["Voice agents answer calls",
+                  "Cal.com — booking pages: https://cal.com",               # in the caption: as is
+                  "11Labs — AI voice agents: https://11labs.io",            # heard, exists: kept with a note
+                  "AI Profit Board — community: https://aiprofiborm.com",   # heard, does not exist: a search
+                  "Airtable — database: https://airtable.com",              # never mentioned: dropped
+                  "Two links https://cal.com and https://evil.example",     # more than one link: dropped
+                  "Booking: https://cal.com@evil.example/x"]                 # not the site it names: dropped
+        looked = []
+        exists = lambda host: looked.append(host) or host == "11labs.io"
+        self.assertEqual(research.vet_links(points, source, transcript, resolves=exists), [
+            "Voice agents answer calls",
+            "Cal.com — booking pages: https://cal.com",
+            "11Labs — AI voice agents (heard in the video — check the spelling): https://11labs.io",
+            "AI Profit Board (heard as aiprofiborm.com; no such address found) — search: https://www.google.com/search?q=AI+Profit+Board"])
+        self.assertEqual(sorted(looked), ["11labs.io", "aiprofiborm.com"])   # caption links are never looked up
+        self.assertEqual(research.vet_links(["Site: https://musical.company"], {"title": "musical.company.io"}, "", resolves=exists), [])
+        long = research.vet_links(["x" * 290 + ": https://11labs.io"], {}, "11labs.io", resolves=exists)[0]
+        self.assertLessEqual(len(long), 300); self.assertTrue(long.endswith(": https://11labs.io"))
+        for point, caption, heard in ((("Docs: https://11labs.io/" + "a" * 400)[:300], {"title": "www.11labs.io"}, ""),
+                                      ("Docs: https://11labs.io/" + "a" * 270, {}, "11labs.io"),
+                                      ("é" * 290 + ": https://aiprofiborm.com", {}, "aiprofiborm.com")):
+            vetted = research.vet_links([point], caption, heard, resolves=exists)[0]
+            self.assertLessEqual(len(vetted), 300, vetted)
+            self.assertRegex(vetted, r": https://(11labs\.io|www\.google\.com/search\?q=\S+)$")   # never a cut address
+        calls = []
+        def flaky(host, port):
+            calls.append(host)
+            if len(calls) == 1:
+                raise socket.gaierror(8, "hiccup")
+            return [(2, 1, 6, "", ("1.2.3.4", port))]
+        with mock.patch.object(research.socket, "getaddrinfo", flaky):
+            self.assertTrue(research._resolves("brew.sh"))   # one hiccup is retried once
+        with mock.patch.object(research.socket, "getaddrinfo", mock.Mock(side_effect=socket.gaierror(8, "no"))):
+            self.assertFalse(research._resolves("aiprofiborm.com"))
+        answer = dict(GOOD, key_points=[f"point {n}" for n in range(13)] + ["Airtable: https://airtable.com", "AI Profit Board — community: https://aiprofiborm.com"])
+        opener = lambda request, timeout=None: Reply({"choices": [{"message": {"content": json.dumps(answer)}}]})
+        with mock.patch.object(research, "_resolves", lambda host: False):
+            result = research.analyze("sign up at aiprofiborm.com", {"platform": "tiktok"}, [], opener=opener)
+        self.assertEqual(result["key_points"], [f"point {n}" for n in range(11)] + ["AI Profit Board (heard as aiprofiborm.com; no such address found) — search: https://www.google.com/search?q=AI+Profit+Board"])
 
     def test_falls_back_to_text_when_images_are_refused_and_never_raises(self):
         with tempfile.TemporaryDirectory() as folder:

@@ -23,11 +23,13 @@ import logging
 import os
 import re
 import shutil
+import socket
 import subprocess
+import threading
 import time
 from pathlib import Path
 from urllib.error import HTTPError
-from urllib.parse import urlsplit
+from urllib.parse import quote_plus, urlsplit
 from urllib.request import Request, urlopen
 
 import research_egress
@@ -282,8 +284,8 @@ production hours, raise visual quality, or let local agents do more of the work,
 SYSTEM = """You turn a short video (a tutorial, a demo, or a news roundup) into a research lesson for a studio's knowledge base, and judge whether it is worth adopting.
 Answer with ONE JSON object only, no prose:
 {"lesson_name": "5-9 words, specific, names the tool or technique",
- "summary": "3-6 sentences: what is taught, how it works, what you would need",
- "key_points": ["up to 8 short, concrete points"],
+ "summary": "at least one sentence per topic: what is taught, how it works, what you would need",
+ "key_points": ["up to 12 short, concrete points, at least one per topic, then one per web link (see Web links)"],
  "tools": ["named products, models, libraries, commands"],
  "category": one of %s,
  "recommendation": {"verdict": one of "adopt" | "trial" | "watch" | "skip",
@@ -292,10 +294,18 @@ Answer with ONE JSON object only, no prose:
    "rationale": "2-4 sentences, honest about hype, cost, risk, privacy (client data must stay local)",
    "effort": "S" | "M" | "L",
    "implementation_steps": ["up to 6 concrete steps to try it in our stack"]}}
-If the video covers several tools or releases (a roundup), the lesson covers ALL of them: lesson_name names the topic and the
+If the video covers several topics, tools or releases (a roundup, or a tip that moves on to another), the lesson covers ALL of them, not only the main one: lesson_name names the topic and the
 items (e.g. "Local AI roundup: Muse Spark, Nemotron 3.5, Bonsai 2B"), the summary gives each item at least one sentence,
 key_points has at least one point per item, and tools lists every one. Judge the recommendation on the item most useful to
 our production and name it in production_fit.
+Web links: when the video points viewers to a website (shows it in the caption, description or on screen, or says "go to",
+"sign up at", "use" a site), add it. A site heard only in the speech counts when the caption, hashtags or pictures show the
+same spelling, or when it is a well-known product site named clearly (cal.com, huggingface.co, brew.sh). Speech-to-text often
+mangles small sites: if the address could be misheard (an odd or made-up-looking word, a brand you do not know, or a spelling
+that differs from the name the speaker says), leave it out. A creator's own course, community or "link in bio" site heard only
+in speech is NOT confirmed. Never guess, complete or invent an address.
+Put each link as its own key point at the end of key_points, in the form "Cal.com — booking pages: https://cal.com" (always
+https://).
 Speech-to-text often misspells names. Correct a name only when the caption, hashtags or pictures show the right spelling;
 otherwise keep the transcript's spelling.
 If the video is mostly hype with no usable technique, say so and use "skip". Never invent tools that were not mentioned or shown.""" % json.dumps(list(CATEGORIES))
@@ -362,6 +372,73 @@ def _strings(value, count, limit):
     return out[:count]
 
 
+def _keep_links(points, count):
+    """Cap the points without cutting the link points the prompt puts last."""
+    links = [p for p in points if "https://" in p][:count]
+    return [p for p in points if "https://" not in p][:count - len(links)] + links
+
+
+LINK = re.compile(r"https://([A-Za-z0-9.-]+)[^\s<>\"']*")
+CHECK_NOTE = " (heard in the video — check the spelling)"
+
+
+def _resolves(host, timeout=3, tries=2):
+    """True when the address exists. A name lookup only: nothing is downloaded. Two tries, so one network hiccup does not
+    turn a real site into a search; a lookup that hangs counts as not found."""
+    for _ in range(tries):
+        found = []
+        def look():
+            try:
+                found.append(bool(socket.getaddrinfo(host, 443)))
+            except OSError:
+                pass
+        worker = threading.Thread(target=look, daemon=True)
+        worker.start()
+        worker.join(timeout)
+        if found and found[0]:
+            return True
+    return False
+
+
+def _mentions(host, text):
+    return re.search(r"(?<![\w-])" + re.escape(host) + r"(?![\w-]|\.\w)", text) is not None
+
+
+def vet_links(points, source, transcript, resolves=None):
+    """The model cannot tell a real link from a misheard one, so code decides: a link in the caption stays as is; one only
+    heard in the audio stays with a check-the-spelling note if the address exists, else becomes a web search for the name;
+    one the video never mentions is dropped."""
+    resolves = resolves or _resolves
+    caption = " ".join([source.get("title", ""), source.get("description", ""), " ".join(source.get("tags", []))]).casefold()
+    heard = (transcript or "").casefold()
+    out = []
+    for point in points:
+        links = list(LINK.finditer(point))
+        if not links:
+            out.append(point)
+            continue
+        url = links[0].group(0)
+        host = links[0].group(1).lower().rstrip(".").removeprefix("www.")
+        if len(links) > 1 or "@" in url or not 3 < len(host) <= 100:
+            continue   # one link per point, and never "https://shown.com@elsewhere" — an unvetted link never ships
+        label = point[:links[0].start()].rstrip(" :")
+        if _mentions(host, caption):
+            if len(point) >= 300 and links[0].end() == len(point):   # cut at 300 inside the address: keep just the site
+                url = "https://" + host
+                point = label[:300 - len(url) - 2] + ": " + url
+            out.append(point)
+        elif _mentions(host, heard) and resolves(host):
+            url = "https://" + host   # a spoken address is a site; any path after it would be the model's guess
+            out.append(label[:300 - len(CHECK_NOTE) - len(url) - 2] + CHECK_NOTE + ": " + url)
+        elif _mentions(host, heard):
+            name = (label.split(" — ")[0].strip() or host)[:60]
+            while len(quote_plus(name)) > 120:   # accented letters grow up to 6x in an address
+                name = name[:-1]
+            search = "https://www.google.com/search?q=" + quote_plus(name)
+            out.append((name + f" (heard as {host}; no such address found) — search")[:300 - len(search) - 2] + ": " + search)
+    return out
+
+
 def normalize(raw):
     rec = raw.get("recommendation") if isinstance(raw.get("recommendation"), dict) else {}
     score = rec.get("value_score")
@@ -376,7 +453,7 @@ def normalize(raw):
     return {
         "lesson_name": name,
         "summary": str(raw.get("summary", "")).strip()[:4000],
-        "key_points": _strings(raw.get("key_points"), 8, 300),
+        "key_points": _strings(raw.get("key_points"), 40, 300),   # capped at 12 in analyze(), after the links are checked
         "tools": _strings(raw.get("tools"), 15, 80),
         "category": category,
         "recommendation": {
@@ -428,6 +505,7 @@ def analyze(transcript, source, thumb_paths=(), opener=urlopen):
                 answer = _chat([{"role": "system", "content": SYSTEM}, {"role": "user", "content": content}], opener=opener)
                 result = normalize(parse_json(answer))
                 if result["lesson_name"]:
+                    result["key_points"] = _keep_links(vet_links(result["key_points"], source, transcript), 12)
                     result.update(ok=True, model=LLM_MODEL, seconds=round(time.time() - started, 1), used_images=content is not text)
                     return result
                 error = "the model gave no lesson name"
