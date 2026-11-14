@@ -54,9 +54,14 @@ VideoAnalyzer can also take **links** instead of files and turn each video into 
 - **Lesson analysis by a local model** (OpenAI-compatible endpoint: Ollama, vllm-mlx, LM Studio — never a hosted API):
   lesson name, summary, key points, tools, category, and a recommendation (adopt / trial / watch / skip, value 0–10,
   where it fits your production flow, effort, steps). Thumbnails are sent as images when the model supports vision.
-  Describe your production flow in a file and point `VA_PRODUCTION_CONTEXT` at it. A **roundup** video (several tools
-  or releases) becomes one lesson that covers every item: its name lists them, and the summary, key points and tools
-  include each one. Misheard names (speech-to-text writes "mu spark" for Muse Spark) are corrected only when the
+  Describe your production flow in a file and point `VA_PRODUCTION_CONTEXT` at it. A video with **several topics** (a
+  roundup, or a tip that moves on to another) becomes one lesson that covers every topic: its name lists them, the
+  summary gives each at least one sentence, and the key points (up to 12) have at least one per topic.
+- **Web links are checked in code, not trusted from the model** (`vet_links`): each link is its own key point at the
+  end. A link in the caption, description or hashtags is kept as is; one only heard in the speech is kept with "heard
+  in the video — check the spelling" if the address exists (a name lookup, two tries, nothing downloaded), otherwise it
+  becomes a Google search for the name; a link mentioned nowhere (made up, or only on screen) is dropped. Points stay
+  within 300 characters and never end in a cut address. Misheard names (speech-to-text writes "mu spark" for Muse Spark) are corrected only when the
   caption, hashtags or pictures show the right spelling.
 - **Send to BadMonkey R&D**: exports the lesson to the BadMonkey workspace's R&D module (automatic when configured).
 
